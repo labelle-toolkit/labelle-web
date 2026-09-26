@@ -1,0 +1,42 @@
+<!doctype html>
+<!-- labelle-web default shell -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LaBelle</title>
+  <link rel="icon" href="labelle-logo.png">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #15151c; }
+    #canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; background: #000; }
+    #loading { position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 24px; background: #15151c;
+      color: #eee; font: 14px system-ui, sans-serif; text-align: center; }
+    #loading[hidden] { display: none; }
+    #loading img { width: min(160px, 35vw); animation: pulse 1.8s ease-in-out infinite; }
+    #loading progress { width: min(300px, 75vw); height: 10px; accent-color: #e8c170; }
+    #loading p { margin: 0; max-width: 80vw; }
+    #loading.failed img { animation: none; }
+    @keyframes pulse { 50% { opacity: .55; transform: scale(.96); } }
+    @media (prefers-reduced-motion: reduce) { #loading img { animation: none; } }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="1024" height="768" aria-label="Game"></canvas>
+  <div id="loading" data-wasm-bytes="__WASM_BYTES__" aria-busy="true">
+    <img src="labelle-logo.png" alt="LaBelle">
+    <progress id="loading-progress" max="1" aria-label="Downloading game"></progress>
+    <p id="loading-status" role="status">Loading game…</p>
+  </div>
+  <script src="labelle-loader.js"></script>
+  <script>
+    var Module = LabelleLoader.install(window.Module || {}, {
+      canvas: document.getElementById('canvas'),
+      overlay: document.getElementById('loading'),
+      progress: document.getElementById('loading-progress'),
+      status: document.getElementById('loading-status')
+    });
+  </script>
+  <script src="game.js" onerror="Module.labelleLoader.fail(new Error('Could not download game.js'))"></script>
+</body>
+</html>

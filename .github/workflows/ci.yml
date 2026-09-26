@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -27,7 +27,7 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
       - name: zig build
-        run: zig build --summary all
+        run: zig build install-shell --summary all
       # Compiles the Zig bindings for wasm32-emscripten (no emsdk needed).
       - name: zig build test
         run: zig build test --summary all
@@ -68,6 +68,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
       - name: Cache emsdk
         uses: actions/cache@v4
         with:
@@ -91,3 +94,38 @@ jobs:
             tests/wasm-boundary/boundary.c src/web_storage.c \
             -o zig-out/wasm-boundary/boundary.js
           node zig-out/wasm-boundary/boundary.js
+      - name: Build a real Emscripten shell fixture
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          mkdir -p zig-out/shell-fixture
+          emcc -O1 tests/shell/main.c -o zig-out/shell-fixture/game.js
+          zig build install-shell
+      - run: npm ci --ignore-scripts
+        working-directory: tests/shell
+      - run: npx playwright install --with-deps chromium
+        working-directory: tests/shell
+      - name: Check real Emscripten startup in Chromium
+        run: EMCC_FIXTURE="$GITHUB_WORKSPACE/zig-out/shell-fixture" BROWSERS=chromium npm test
+        working-directory: tests/shell
+
+  shell:
+    name: Browser shell (Chromium, Firefox, WebKit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: zig build install-shell
+      - run: npm ci --ignore-scripts
+        working-directory: tests/shell
+      - run: npx playwright install --with-deps chromium firefox webkit
+        working-directory: tests/shell
+      - run: npm test
+        working-directory: tests/shell
