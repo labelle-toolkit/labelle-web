@@ -113,9 +113,11 @@ for local serve and export; stage custom assets first and pass their original
 source directory. I/O errors propagate instead of silently falling back.
 
 The provider uses this API automatically after build and before serving/export.
-Its private `.labelle-shell-state.json` tracks the original emitted page so
+Its private `.labelle-shell-state.json` tracks copied custom files and the original emitted page so
 repeated staging restamps it and removing a project override restores the
-emitted/default page. The server hides this file; exports omit it.
+emitted/default page. Deleted custom files are removed when their staged bytes
+still match the last copy; newly emitted backend replacements are preserved.
+The server hides this file; exports omit it.
 
 ## CLI provider
 

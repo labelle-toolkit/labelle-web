@@ -68,7 +68,7 @@ fn execute(init: std.process.Init) !void {
     // A stale empty/generated directory is never a successful build.
     for ([_][]const u8{ "game.js", "game.wasm" }) |name| {
         const file = try std.fs.path.join(a, &.{ web, name });
-        if ((try cwd.statFile(io, file, .{})).kind != .file) return error.InvalidBuildArtifact;
+        if ((try cwd.statFile(io, file, .{ .follow_symlinks = false })).kind != .file) return error.InvalidBuildArtifact;
     }
     const project_web = try std.fs.path.join(a, &.{ project, "web" });
     if (std.mem.eql(u8, action, "export")) {
@@ -78,12 +78,8 @@ fn execute(init: std.process.Init) !void {
         const root = try cwd.realPathFileAlloc(io, project, a);
         if (contains(out, root) or contains(out, web) or contains(web, out)) return error.DestructiveOutputPath;
         // A source custom-page directory must survive even if it bears an export marker.
-        if (cwd.realPathFileAlloc(io, project_web, a)) |custom| {
-            if (contains(out, custom) or contains(custom, out)) return error.DestructiveOutputPath;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
+        const custom = try canonical(a, io, project_web);
+        if (contains(out, custom) or contains(custom, out)) return error.DestructiveOutputPath;
         try exporter.packageExport(a, web, project_web, .{ .output_dir = out, .zip = opts.zip, .platform = opts.platform });
     } else {
         if (opts.output != null or opts.zip or opts.platform != .none) return error.ExportOptionOnServe;
@@ -92,7 +88,7 @@ fn execute(init: std.process.Init) !void {
             const port = opts.port orelse settings.port;
             if (port == 0) return error.InvalidPort;
             // Serve the stamped copy, never the original placeholder-bearing source.
-            try server.serveAndOpen(a, web, null, port, settings.open_browser and !opts.no_open, null);
+            try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null);
         }
     }
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 pub const state_file = ".labelle-shell-state.json";
-const State = struct { original: ?[]const u8, rendered: [64]u8 };
+const Custom = struct { path: []const u8, digest: [64]u8 };
+const State = struct { original: ?[]const u8, rendered: [64]u8, custom: []const Custom = &.{} };
 const shell = @import("../shell.zig");
 
 /// Copy custom page resources and stamp the shell from its original source.
@@ -29,18 +30,43 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         else => return err,
     } else null;
     defer if (project) |dir| dir.close(io);
+    var copied: std.ArrayList(Custom) = .empty;
+    defer {
+        for (copied.items) |entry| a.free(entry.path);
+        copied.deinit(a);
+    }
     if (project) |dir| {
         const src_real = try dir.realPathFileAlloc(io, ".", a);
         defer a.free(src_real);
         const out_real = try out.realPathFileAlloc(io, ".", a);
         defer a.free(out_real);
         if (within(out_real, src_real) or within(src_real, out_real)) return error.OverlappingShellDirectories;
-        try copy(a, io, dir, out, true);
+        try copy(a, io, dir, out, "", &copied);
     }
+    if (previous) |state| for (state.value.custom) |old| {
+        var retained = false;
+        for (copied.items) |entry| {
+            if (std.mem.eql(u8, old.path, entry.path)) {
+                retained = true;
+                break;
+            }
+            // Case-only renames can refer to the same destination on a
+            // case-insensitive volume. Do not delete the freshly copied file.
+            if (std.ascii.eqlIgnoreCase(old.path, entry.path)) {
+                const old_stat = out.statFile(io, old.path, .{ .follow_symlinks = false }) catch continue;
+                const new_stat = try out.statFile(io, entry.path, .{ .follow_symlinks = false });
+                if (old_stat.inode == new_stat.inode) {
+                    retained = true;
+                    break;
+                }
+            }
+        }
+        if (!retained) try removeStale(a, io, out, old.path, old.digest);
+    };
     _ = try shell.stage(a, io, out, project);
     const rendered = (try optional(a, io, out, "index.html")).?;
     defer a.free(rendered);
-    const saved = try std.json.Stringify.valueAlloc(a, State{ .original = original, .rendered = hash(rendered) }, .{});
+    const saved = try std.json.Stringify.valueAlloc(a, State{ .original = original, .rendered = hash(rendered), .custom = copied.items }, .{});
     defer a.free(saved);
     try out.writeFile(io, .{ .sub_path = state_file, .data = saved });
     // Stamping/loader updates invalidate precompressed copies.
@@ -67,7 +93,8 @@ fn within(child: []const u8, parent: []const u8) bool {
     return prefix and (child.len == parent.len or (child.len > parent.len and (std.fs.path.isSep(parent[parent.len - 1]) or std.fs.path.isSep(child[parent.len]))));
 }
 
-fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, root: bool) !void {
+fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, prefix: []const u8, copied: *std.ArrayList(Custom)) !void {
+    const root = prefix.len == 0;
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.mem.eql(u8, entry.name, "index.html")) continue;
@@ -90,6 +117,9 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, root
                 try regularOrMissing(io, dst, entry.name);
                 try src.copyFile(entry.name, dst, entry.name, io, .{});
                 try invalidateCompressed(a, io, dst, entry.name);
+                const path = try std.fs.path.join(a, &.{ prefix, entry.name });
+                errdefer a.free(path);
+                try copied.append(a, .{ .path = path, .digest = try hashFile(io, dst, entry.name) });
             },
             .directory => {
                 if (dst.statFile(io, entry.name, .{ .follow_symlinks = false })) |st| {
@@ -103,11 +133,53 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, root
                 defer from.close(io);
                 const to = try dst.openDir(io, entry.name, .{});
                 defer to.close(io);
-                try copy(a, io, from, to, false);
+                const child = try std.fs.path.join(a, &.{ prefix, entry.name });
+                defer a.free(child);
+                try copy(a, io, from, to, child, copied);
             },
             else => return error.UnsupportedWebAsset,
         }
     }
+}
+
+/// Remove only our unchanged copies. A backend may have emitted a new file
+/// since staging; a differing digest belongs to that newer build and survives.
+/// Resolve one component at a time without following symlinks from stale state.
+fn removeStale(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, digest: [64]u8) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, ':') != null) return error.InvalidAssetProvenance;
+    const sep = std.mem.indexOfAny(u8, path, "/\\");
+    const head = path[0 .. sep orelse path.len];
+    if (head.len == 0 or std.mem.eql(u8, head, ".") or std.mem.eql(u8, head, "..")) return error.InvalidAssetProvenance;
+    const st = dir.statFile(io, head, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (sep) |at| {
+        if (st.kind != .directory) return error.InvalidWebAssetDestination;
+        const child = try dir.openDir(io, head, .{ .follow_symlinks = false });
+        defer child.close(io);
+        return removeStale(a, io, child, path[at + 1 ..], digest);
+    }
+    if (st.kind != .file) return error.InvalidWebAssetDestination;
+    if (!std.mem.eql(u8, &digest, &try hashFile(io, dir, head))) return;
+    try dir.deleteFile(io, head);
+    try invalidateCompressed(a, io, dir, head);
+}
+fn hashFile(io: std.Io, dir: std.Io.Dir, path: []const u8) ![64]u8 {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    var chunk: [8192]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    while (true) {
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn hash(bytes: []const u8) [64]u8 {

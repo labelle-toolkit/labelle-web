@@ -59,6 +59,8 @@ pub fn packageExport(
         return error.BuildFailed;
     };
 
+    try validateBuildTree(io, cwd, web_dir);
+
     // Safety gate 1: refuse an output that names an existing regular FILE.
     // `outputDirIsUnsafe` can't see this (its `openDir` just fails), so the
     // wipe below would silently delete the user's file and replace it with
@@ -165,7 +167,27 @@ pub fn packageExport(
     printReport(files.items, opts, wasm_opt_ran, zip_path);
 }
 
-const Ownership = struct { zip_sha256: ?[64]u8 = null };
+const Ownership = struct { format: []const u8 = "labelle-web-export-v1", zip_sha256: ?[64]u8 = null };
+
+/// Refuse unsupported entries before clearing any existing destination.
+fn validateBuildTree(io: std.Io, parent: std.Io.Dir, path: []const u8) !void {
+    const dir = try parent.openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| switch (entry.kind) {
+        .directory => try validateBuildTree(io, dir, entry.name),
+        .file => {},
+        else => return error.UnsupportedBuildArtifact,
+    };
+}
+
+fn recognizedMarker(data: []const u8) bool {
+    if (std.mem.eql(u8, data, "labelle web export output dir\n")) return true;
+    const Required = struct { format: []const u8, zip_sha256: ?[64]u8 = null };
+    const parsed = std.json.parseFromSlice(Required, std.heap.page_allocator, data, .{}) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.format, "labelle-web-export-v1");
+}
 
 fn readOwnership(a: std.mem.Allocator, io: std.Io, output: []const u8) !Ownership {
     const path = try std.fs.path.join(a, &.{ output, export_marker });
@@ -178,7 +200,7 @@ fn readOwnership(a: std.mem.Allocator, io: std.Io, output: []const u8) !Ownershi
     // Old text-only markers do not establish ownership of an adjacent ZIP.
     const parsed = std.json.parseFromSlice(Ownership, a, data, .{}) catch return .{};
     defer parsed.deinit();
-    return parsed.value;
+    return .{ .zip_sha256 = parsed.value.zip_sha256 };
 }
 fn writeOwnership(a: std.mem.Allocator, io: std.Io, marker: []const u8, value: Ownership) !void {
     const data = try std.json.Stringify.valueAlloc(a, value, .{});
@@ -692,13 +714,17 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 /// could destroy the user's files, so `packageExport` refuses. A missing
 /// path, an empty dir, or a marker-bearing dir is safe (returns false).
 pub fn outputDirIsUnsafe(io: std.Io, path: []const u8) bool {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| return err != error.FileNotFound;
     defer dir.close(io);
     var it = dir.iterate();
     var empty = true;
-    while (it.next(io) catch return false) |entry| {
-        if (std.mem.eql(u8, entry.name, export_marker)) return false; // a prior export
+    while (it.next(io) catch return true) |entry| {
         empty = false;
+        if (!std.mem.eql(u8, entry.name, export_marker)) continue;
+        if (entry.kind != .file) return true;
+        const data = dir.readFileAlloc(io, export_marker, std.heap.page_allocator, .limited(1024)) catch return true;
+        defer std.heap.page_allocator.free(data);
+        return !recognizedMarker(data);
     }
     return !empty;
 }
@@ -746,7 +772,7 @@ test "outputDirIsUnsafe: missing/empty/marked are safe, populated is not" {
     try std.testing.expect(outputDirIsUnsafe(io, user));
 
     // Populated WITH the export marker → safe (a prior export).
-    try tmp.dir.writeFile(io, .{ .sub_path = "user/" ++ export_marker, .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "user/" ++ export_marker, .data = "labelle web export output dir\n" });
     try std.testing.expect(!outputDirIsUnsafe(io, user));
 }
 

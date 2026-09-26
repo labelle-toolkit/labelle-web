@@ -51,6 +51,40 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert (dist / 'labelle-loader.js').is_file()
     with zipfile.ZipFile(project / 'dist.zip') as archive:
         assert archive.read('index.html') == (dist / 'index.html').read_bytes()
+    # Source paths are protected before they exist, not only after realpath succeeds.
+    run('web', 'export', '--output=web', fail='DestructiveOutputPath')
+    run('web', 'export', '--output=web/new', fail='DestructiveOutputPath')
+    assert not (project / 'web').exists()
+    for bad in ('marker-directory', 'marker-invalid'):
+        folder = project / bad
+        folder.mkdir()
+        (folder / 'keep').write_text('keep')
+        if bad == 'marker-directory':
+            (folder / '.labelle-export').mkdir()
+        else:
+            (folder / '.labelle-export').write_text('{}')
+        run('web', 'export', f'--output={bad}', fail='DestructiveOutputPath')
+        assert (folder / 'keep').read_text() == 'keep'
+    if os.name != 'nt':
+        folder = project / 'marker-link'
+        folder.mkdir()
+        (folder / 'keep').write_text('keep')
+        (folder / '.labelle-export').symlink_to(dist / '.labelle-export')
+        run('web', 'export', '--output=marker-link', fail='DestructiveOutputPath')
+        assert (folder / 'keep').read_text() == 'keep'
+        # Neither required nor auxiliary symlinks may silently vanish from export.
+        original_js = (web / 'game.js').read_bytes()
+        (project / 'real-game.js').write_bytes(original_js)
+        (web / 'game.js').unlink()
+        (web / 'game.js').symlink_to(project / 'real-game.js')
+        run('web', 'export', '--output=dist', fail='InvalidBuildArtifact')
+        (web / 'game.js').unlink()
+        (web / 'game.js').write_bytes(original_js)
+        original_export = (dist / 'index.html').read_bytes()
+        (web / 'linked-extra.js').symlink_to(project / 'real-game.js')
+        run('web', 'export', '--output=dist', fail='UnsupportedBuildArtifact')
+        assert (dist / 'index.html').read_bytes() == original_export
+        (web / 'linked-extra.js').unlink()
     # Custom source stays untouched; relative page resources ship with it.
     custom = project / 'web'
     custom.mkdir()
@@ -103,6 +137,26 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         assert result.stdout == '', 'JSON progress mode must not emit non-protocol stdout'
     hook()
     assert (web / 'index.html').read_text() == source.replace('__WASM_BYTES__', '8')
+    # Deleted custom files disappear from staging and export, while newly emitted
+    # backend content replacing an old overlay is preserved.
+    (custom / 'nested').mkdir()
+    (custom / 'nested/removed.txt').write_text('remove me')
+    (custom / 'overridden.txt').write_text('old custom')
+    hook()
+    (custom / 'nested/removed.txt').unlink()
+    (custom / 'overridden.txt').unlink()
+    (web / 'overridden.txt').write_text('new backend')
+    run('web', 'export', '--output=dist')
+    assert not (dist / 'nested/removed.txt').exists()
+    assert (dist / 'overridden.txt').read_text() == 'new backend'
+    hook()
+    assert not (web / 'nested/removed.txt').exists()
+    assert (web / 'overridden.txt').read_text() == 'new backend'
+    (custom / 'CaseAsset.txt').write_text('case rename')
+    hook()
+    (custom / 'CaseAsset.txt').rename(custom / 'caseasset.txt')
+    hook()
+    assert (web / 'caseasset.txt').read_text() == 'case rename'
     # Rebuilding/restaging after a custom page is removed restores the default.
     (custom / 'index.html').unlink()
     hook()
