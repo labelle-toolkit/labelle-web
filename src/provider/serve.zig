@@ -141,7 +141,7 @@ fn serveLoop(
             stream.close(io);
             return;
         }
-        handleConnection(io, allocator, stream, web_dir, project_web_dir, watch_state) catch |err| {
+        handleConnection(io, allocator, stream, web_dir, project_web_dir, watch_state, cancel) catch |err| {
             std.debug.print("labelle: connection error ({s})\n", .{@errorName(err)});
         };
     }
@@ -286,6 +286,18 @@ fn resolveRoot(
     return null;
 }
 
+// Interrupt the active read/write as well as the listener. Joining before
+// closing the stream prevents a shutdown racing a reused socket handle.
+fn cancelConnection(io: std.Io, stream: std.Io.net.Stream, cancel: *const std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+    while (!stop.load(.acquire)) {
+        if (cancel.load(.acquire)) {
+            stream.shutdown(io, .both) catch {};
+            return;
+        }
+        io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch return;
+    }
+}
+
 /// Serve a single HTTP/1.1 request off `stream`, then close it.
 /// Connection: close — no keep-alive; the dev loop reopens per asset.
 fn handleConnection(
@@ -295,8 +307,15 @@ fn handleConnection(
     web_dir: []const u8,
     project_web_dir: ?[]const u8,
     watch_state: ?*WatchState,
+    cancel: ?*const std.atomic.Value(bool),
 ) !void {
     defer stream.close(io);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const watcher = if (cancel) |flag| try std.Thread.spawn(.{}, cancelConnection, .{ io, stream, flag, &stop }) else null;
+    defer if (watcher) |thread| {
+        stop.store(true, .release);
+        thread.join();
+    };
 
     var recv_buf: [16 * 1024]u8 = undefined;
     var send_buf: [64 * 1024]u8 = undefined;
@@ -1592,7 +1611,7 @@ fn testServeNWatch(
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const stream = server.accept(io) catch return;
-        handleConnection(io, alloc, stream, web_dir, project_web_dir, watch_state) catch {};
+        handleConnection(io, alloc, stream, web_dir, project_web_dir, watch_state, null) catch {};
     }
 }
 
@@ -2186,6 +2205,15 @@ test "serveLoop: returns on a stop request after serving what came before it" {
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "still here") != null);
     }
+
+    // An incomplete request must not trap the server in receiveHead.
+    const stalled = try peer.connect(io, .{ .mode = .stream });
+    defer stalled.close(io);
+    var partial_buf: [128]u8 = undefined;
+    var partial = stalled.writer(io, &partial_buf);
+    try partial.interface.writeAll("GET / HTTP/1.1\r\nHost:");
+    try partial.interface.flush();
+    try io.sleep(std.Io.Duration.fromMilliseconds(100), .awake);
 
     // The stop: flag, then the same poke the waker thread sends. The join
     // completes only because the loop saw the flag — a loop that ignored it

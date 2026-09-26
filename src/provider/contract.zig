@@ -23,10 +23,12 @@ pub fn carriesBuildNumber(wire_version: []const u8) bool {
 }
 
 fn supported(wire_version: []const u8) bool {
-    for (supported_versions) |candidate| {
-        if (std.mem.eql(u8, wire_version, candidate)) return true;
-    }
-    return false;
+    const wire = std.SemanticVersion.parse(wire_version) catch return false;
+    return wire.major == 1 and wire.minor <= 1 and wire.pre == null;
+}
+test "decoder accepts stable compatible patches only" {
+    for ([_][]const u8{ "1.0.1", "1.1.1", "1.1.42" }) |wire| try std.testing.expect(supported(wire));
+    for ([_][]const u8{ "1.2.0", "2.0.0", "1.1.1-rc.1", "invalid" }) |wire| try std.testing.expect(!supported(wire));
 }
 pub const context_env = "LABELLE_CONTEXT";
 pub const Step = enum { generate, build, bundle, run };

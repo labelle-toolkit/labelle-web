@@ -103,6 +103,7 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
     const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{});
     defer dst.close(io);
     for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |name| try regularOrMissing(io, dst, name);
+    if (try optional(a, io, dst, "index.html")) |page| a.free(page);
     var previous: ?std.json.Parsed(State) = null;
     defer if (previous) |value| value.deinit();
     var owned = Owned.init(a);
@@ -110,6 +111,9 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
     if (try optional(a, io, dst, state_file)) |saved| {
         defer a.free(saved);
         previous = try std.json.parseFromSlice(State, a, saved, .{ .allocate = .alloc_always });
+        if (previous.?.value.original) |page| {
+            if (page.len > 16 * 1024 * 1024) return error.StreamTooLong;
+        }
         owned.legacy_directories = previous.?.value.schema < 2;
         for (previous.?.value.custom) |entry| {
             try owned.files.put(entry.path, entry.digest);
@@ -128,6 +132,7 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
         else => return err,
     };
     defer src.close(io);
+    if (try optional(a, io, src, "index.html")) |page| a.free(page);
     const source = try src.realPathFileAlloc(io, ".", a);
     defer a.free(source);
     const output = try dst.realPathFileAlloc(io, ".", a);

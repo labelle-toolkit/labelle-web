@@ -85,10 +85,10 @@ fn execute(init: std.process.Init) !void {
         const out_arg = if (ctx.invocation.kind == .hook) ctx.output_dir else opts.output orelse "dist";
         const out = try canonical(a, io, try std.fs.path.resolve(a, &.{ project, out_arg }));
         const root = try cwd.realPathFileAlloc(io, project, a);
-        if (contains(out, root) or contains(out, web) or contains(web, out)) return error.DestructiveOutputPath;
+        if (try contains(io, out, root) or try contains(io, out, web) or try contains(io, web, out)) return error.DestructiveOutputPath;
         // A source custom-page directory must survive even if it bears an export marker.
         const custom = try canonical(a, io, project_web);
-        if (contains(out, custom) or contains(custom, out)) return error.DestructiveOutputPath;
+        if (try contains(io, out, custom) or try contains(io, custom, out)) return error.DestructiveOutputPath;
         try exporter.packageExport(init.gpa, web, project_web, .{ .output_dir = out, .zip = opts.zip, .platform = opts.platform });
     } else {
         if (opts.output != null or opts.zip or opts.platform != .none) return error.ExportOptionOnServe;
@@ -126,8 +126,28 @@ fn canonical(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
         else => return err,
     };
 }
-fn contains(parent: []const u8, child: []const u8) bool {
-    const prefix = if (@import("builtin").os.tag == .windows) std.ascii.startsWithIgnoreCase(child, parent) else std.mem.startsWith(u8, child, parent);
+extern "c" fn fpathconf(fd: c_int, name: c_int) c_long;
+fn caseInsensitive(io: std.Io, path: []const u8) !bool {
+    const os = @import("builtin").os.tag;
+    if (os == .windows) return true;
+    if (os != .macos) return false;
+    var ancestor = path;
+    while (true) {
+        const dir = std.Io.Dir.cwd().openDir(io, ancestor, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                ancestor = std.fs.path.dirname(ancestor) orelse return err;
+                continue;
+            },
+            else => return err,
+        };
+        defer dir.close(io);
+        // Darwin sys/unistd.h: _PC_CASE_SENSITIVE = 11. On an unknown
+        // filesystem, conservatively protect possible source aliases.
+        return fpathconf(dir.handle, 11) != 1;
+    }
+}
+fn contains(io: std.Io, parent: []const u8, child: []const u8) !bool {
+    const prefix = if (try caseInsensitive(io, parent)) std.ascii.startsWithIgnoreCase(child, parent) else std.mem.startsWith(u8, child, parent);
     return prefix and (child.len == parent.len or (child.len > parent.len and (std.fs.path.isSep(parent[parent.len - 1]) or std.fs.path.isSep(child[parent.len]))));
 }
 

@@ -55,6 +55,11 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     # Source paths are protected before they exist, not only after realpath succeeds.
     run('web', 'export', '--output=web', fail='DestructiveOutputPath')
     run('web', 'export', '--output=web/new', fail='DestructiveOutputPath')
+    if (project / 'PROJECT.LABELLE').exists():
+        run('web', 'export', '--output=Web', fail='DestructiveOutputPath')
+        run('web', 'export', '--output=Web/new', fail='DestructiveOutputPath')
+        assert not (project / 'web').exists()
+
     assert not (project / 'web').exists()
     for bad in ('marker-directory', 'marker-invalid'):
         folder = project / bad
@@ -309,6 +314,13 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert (project / 'bundle/index.html').read_bytes() == previous_release
     state_path.write_bytes(saved_state)
     (project / 'web-away').rename(custom)
+    # Oversized pages fail before clearing a previously published export.
+    for page_path in (web / 'index.html', custom / 'index.html'):
+        saved_page = page_path.read_bytes()
+        page_path.write_bytes(b'x' * (16 * 1024 * 1024 + 1))
+        hook(fail='StreamTooLong')
+        assert (project / 'bundle/index.html').read_bytes() == previous_release
+        page_path.write_bytes(saved_page)
     # JSON escaping may make provenance larger than the supported source HTML.
     context.update(invocation=dict(kind='hook', id='shell', step='build', phase='after'), output_dir=str(web.parent))
     large_page = '"' * (9 * 1024 * 1024)
@@ -396,6 +408,36 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
             os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=15)
         log.close()
+    if os.name != 'nt':
+        # Signal the provider itself: the CLI parent has its own signal policy.
+        with socket.socket() as free_port:
+            free_port.bind(('127.0.0.1', 0))
+            port = free_port.getsockname()[1]
+        serve_config = temp / 'serve-config.json'
+        serve_config.write_text(json.dumps(dict(port=port, open_browser=False)))
+        context.update(invocation=dict(kind='hook', id='serve', step='run', phase='replace'), output_dir=str(web.parent), config_file=str(serve_config))
+        ctxfile.write_text(json.dumps(context))
+        direct = subprocess.Popen([exe], cwd=project, env=dict(env, LABELLE_CONTEXT=str(ctxfile)), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    stalled = socket.create_connection(('127.0.0.1', port), timeout=1)
+                    break
+                except OSError:
+                    assert direct.poll() is None and time.monotonic() < deadline
+                    time.sleep(0.05)
+            with stalled:
+                stalled.sendall(b'GET / HTTP/1.1\r\nHost:')
+                time.sleep(0.2)
+                direct.terminate()
+                stdout, stderr = direct.communicate(timeout=5)
+                assert direct.returncode == 0, stderr
+                assert stdout == b''
+        finally:
+            if direct.poll() is None:
+                direct.kill()
+                direct.wait()
     # Several generated backends cannot silently choose the wrong wasm.
     other = project / '.labelle/other_wasm/zig-out/web'
     other.mkdir(parents=True)
