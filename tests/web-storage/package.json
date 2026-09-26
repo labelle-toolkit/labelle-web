@@ -1,0 +1,1 @@
+{"private":true,"type":"module","scripts":{"test":"node --test storage.test.mjs"},"devDependencies":{"fake-indexeddb":"6.2.5"}}
