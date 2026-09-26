@@ -105,6 +105,25 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         assert (dist / 'index.html').read_bytes() == original_export
         run('web', 'serve', '--no-open', fail='UnsupportedBuildArtifact')
         (web / 'linked-extra.js').unlink()
+    # Generated root filenames must retain their portable exact spelling.
+    for name in ('index.html', 'labelle-loader.js', 'labelle-logo.png', '.labelle-shell-state.json'):
+        path = web / name
+        saved = path.read_bytes() if path.exists() else None
+        if path.exists():
+            path.unlink()
+        wrong_case = web / name.upper()
+        wrong_case.write_text('wrong casing')
+        release_before = (dist / 'index.html').read_bytes()
+        run('web', 'export', '--output=dist', fail='InvalidWebAssetSpelling')
+        assert (dist / 'index.html').read_bytes() == release_before
+        assert wrong_case.read_text() == 'wrong casing'
+        wrong_case.unlink()
+        if saved is not None:
+            path.write_bytes(saved)
+    (web / '.NOJEKYLL').write_text('wrong casing')
+    run('web', 'export', '--output=dist', '--platform=github-pages', fail='InvalidPagesMarker')
+    assert (dist / 'index.html').read_bytes() == release_before
+    (web / '.NOJEKYLL').unlink()
     # Runtime names must deploy to case-sensitive hosts without changing spelling.
     (web / 'game.js').rename(web / 'GAME.JS')
     run('web', 'export', '--output=dist', fail='InvalidBuildArtifact')

@@ -238,6 +238,15 @@ fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 fn validatePagesMarker(a: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    const dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+    var entries = dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, ".nojekyll") and !std.mem.eql(u8, entry.name, ".nojekyll")) return error.InvalidPagesMarker;
+    }
     const path = try std.fs.path.join(a, &.{ root, ".nojekyll" });
     defer a.free(path);
     const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {

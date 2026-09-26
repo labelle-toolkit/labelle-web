@@ -100,8 +100,15 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
 
 /// Validate the complete custom overlay before any file or provenance changes.
 pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_path: ?[]const u8) !void {
-    const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{});
+    const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{ .iterate = true });
     defer dst.close(io);
+    var entries = dst.iterate();
+    while (try entries.next(io)) |entry| {
+        for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |name| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name) and !std.mem.eql(u8, entry.name, name)) return error.InvalidWebAssetSpelling;
+        }
+    }
+
     for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |name| try regularOrMissing(io, dst, name);
     if (try optional(a, io, dst, "index.html")) |page| a.free(page);
     var previous: ?std.json.Parsed(State) = null;
