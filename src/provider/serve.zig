@@ -373,10 +373,6 @@ fn handleConnection(
         else => return err,
     };
     defer allocator.free(actual);
-    if (std.ascii.eqlIgnoreCase(std.fs.path.basename(actual), @import("assets.zig").state_file)) {
-        try request.respond("403 Forbidden\n", .{ .status = .forbidden });
-        return;
-    }
     var contained = false;
     for ([_]?[]const u8{ web_dir, project_web_dir }) |candidate| {
         const source = candidate orelse continue;
@@ -385,6 +381,13 @@ fn handleConnection(
             else => return err,
         };
         defer allocator.free(root);
+        const parent = std.fs.path.dirname(actual) orelse "";
+        const at_root = if (builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(parent, root) else std.mem.eql(u8, parent, root);
+        if (at_root and std.ascii.eqlIgnoreCase(std.fs.path.basename(actual), @import("assets.zig").state_file)) {
+            try request.respond("403 Forbidden\n", .{ .status = .forbidden });
+            return;
+        }
+
         const prefix = if (builtin.os.tag == .windows) std.ascii.startsWithIgnoreCase(actual, root) else std.mem.startsWith(u8, actual, root);
         if (prefix and (actual.len == root.len or (actual.len > root.len and (std.fs.path.isSep(root[root.len - 1]) or std.fs.path.isSep(actual[root.len]))))) contained = true;
     }
@@ -485,11 +488,12 @@ fn resolvePath(raw_path: []const u8) ?[]const u8 {
     // request walk out of `web_dir`.
     if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
     var it = std.mem.splitScalar(u8, path, '/');
+    var first_component = true;
     while (it.next()) |seg| {
         if (std.mem.eql(u8, seg, "..")) return null;
-        // Match path components, including /./ aliases and case-insensitive
-        // host filesystems, so build-only page provenance never gets served.
-        if (std.ascii.eqlIgnoreCase(seg, @import("assets.zig").state_file)) return null;
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (first_component and std.ascii.eqlIgnoreCase(seg, @import("assets.zig").state_file)) return null;
+        first_component = false;
     }
     return path;
 }

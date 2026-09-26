@@ -102,6 +102,7 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
 pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_path: ?[]const u8) !void {
     const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{});
     defer dst.close(io);
+    for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |name| try regularOrMissing(io, dst, name);
     var previous: ?std.json.Parsed(State) = null;
     defer if (previous) |value| value.deinit();
     var owned = Owned.init(a);
@@ -159,7 +160,7 @@ fn validateCustom(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: ?std.I
                     else => return err,
                 };
                 if (st) |existing| switch (existing.kind) {
-                    .file => {},
+                    .file => if (existing.nlink > 1) return error.InvalidWebAssetDestination,
                     .directory => {
                         const tree = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
                         defer tree.close(io);
@@ -321,7 +322,7 @@ fn removeStale(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const 
         return removeStale(a, io, child, path[at + 1 ..], digest);
     }
     if (st.kind == .directory) return; // a backend replaced this custom file
-    if (st.kind != .file) return error.InvalidWebAssetDestination;
+    if (st.kind != .file or st.nlink > 1) return error.InvalidWebAssetDestination;
     if (!std.mem.eql(u8, &digest, &try hashFile(io, dir, head))) return;
     try dir.deleteFile(io, head);
     try invalidateCompressed(a, io, dir, head);
@@ -372,7 +373,7 @@ fn hash(bytes: []const u8) [64]u8 {
 }
 fn regularOrMissing(io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
     if (dir.statFile(io, name, .{ .follow_symlinks = false })) |st| {
-        if (st.kind != .file) return error.InvalidWebAssetDestination;
+        if (st.kind != .file or st.nlink > 1) return error.InvalidWebAssetDestination;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,

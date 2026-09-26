@@ -238,6 +238,18 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     hook(fail='InvalidWebAssetDestination')
     assert (web / 'backend-empty').is_dir()
     (custom / 'backend-empty').unlink()
+    # Copying an overlay must not truncate another file sharing its inode.
+    outside = project / 'hardlink-source.txt'
+    outside.write_text('must survive')
+    (custom / 'linked.txt').write_text('new custom content')
+    os.link(outside, web / 'linked.txt')
+    hook(fail='InvalidWebAssetDestination')
+    assert outside.read_text() == 'must survive'
+    (web / 'linked.txt').unlink()
+    (custom / 'linked.txt').unlink()
+    (custom / 'config').mkdir()
+    (custom / 'config/.labelle-shell-state.json').write_text('ordinary nested asset')
+    hook()
     # Invalid semantic settings fail before restamping the existing output.
     page_before = (web / 'index.html').read_bytes()
     run('web', 'serve', '--port=0', fail='InvalidPort')
@@ -375,6 +387,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
                 raise AssertionError('private staging metadata was served')
             except urllib.error.HTTPError as error:
                 assert error.code in (400, 404), error.code
+        assert urllib.request.urlopen(f'http://127.0.0.1:{port}/config/.labelle-shell-state.json').read() == b'ordinary nested asset'
         assert urllib.request.urlopen(f'http://127.0.0.1:{port}/extra.js').read() == b'window.extra = true;'
     finally:
         if os.name == 'nt':
