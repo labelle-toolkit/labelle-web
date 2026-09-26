@@ -37,10 +37,17 @@ EM_JS(void, labelle_blob_init_js, (), {
             promise.catch(() => { if (databases.get(namespace) === promise) databases.delete(namespace); });
             return promise;
         }
+        function byteSize(bytes) {
+            if (bytes instanceof Uint8Array) return bytes.byteLength;
+            if (bytes instanceof Blob) return bytes.size;
+            throw new Error('invalid stored bytes');
+        }
         function begin(namespace, kind, name, input, maxBytes) {
             // Copy before returning: wasm memory and callers' buffers can be
             // reused/grown as soon as begin returns.
-            const bytes = kind === 1 ? new Blob([input]) : null;
+            // Typed bytes avoid WebKit's Blob/File preparation failures in
+            // ephemeral stores. Keep the record schema and old Blob reads.
+            const bytes = kind === 1 ? new Uint8Array(input) : null;
             if (nextId > 0xffffffff) return 0; // never alias a live handle
             const id = nextId++;
             const operation = { status: 0, bytes: new Uint8Array() };
@@ -61,9 +68,12 @@ EM_JS(void, labelle_blob_init_js, (), {
                     if (failure) { operation.status = code(failure); return; }
                     if (kind === 0) {
                         if (!value) { operation.status = -1; return; }
-                        if (value.bytes.size > maxBytes) { operation.status = -5; return; }
-                        value.bytes.arrayBuffer().then(buffer => {
-                            operation.bytes = new Uint8Array(buffer);
+                        if (byteSize(value.bytes) > maxBytes) { operation.status = -5; return; }
+                        const data = value.bytes instanceof Uint8Array
+                            ? Promise.resolve(new Uint8Array(value.bytes))
+                            : value.bytes.arrayBuffer().then(buffer => new Uint8Array(buffer));
+                        data.then(bytes => {
+                            operation.bytes = bytes;
                             operation.status = 1;
                         }).catch(e => { operation.status = code(e); });
                     } else {
@@ -84,7 +94,7 @@ EM_JS(void, labelle_blob_init_js, (), {
                         const cursor = request.result;
                         if (!cursor) return;
                         const record = cursor.value;
-                        entries.push({ name: record.name, size: record.bytes.size, modified_ms: record.modified_ms });
+                        entries.push({ name: record.name, size: byteSize(record.bytes), modified_ms: record.modified_ms });
                         cursor.continue();
                         } catch (e) { failure = e; tx.abort(); }
                     };

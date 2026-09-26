@@ -175,3 +175,28 @@ test('blocked opens and malformed stored records terminate with errors rather th
     }
     await api.close();
 });
+
+
+test('legacy Blob records still load; new records store copied typed bytes', async () => {
+    const idb = new IDBFactory();
+    const api = create(idb);
+    await run(api, 1, 'new.json', bytes('typed'));
+    const db = await new Promise((resolve, reject) => {
+        const request = idb.open('labelle.blobs.test-game', 1);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction('blobs', 'readwrite');
+        tx.objectStore('blobs').put({name: 'old.json', bytes: new Blob(['legacy']), modified_ms: 1});
+        tx.objectStore('blobs').get('new.json').onsuccess = event => {
+            assert.ok(event.target.result.bytes instanceof Uint8Array);
+        };
+        tx.oncomplete = resolve;
+        tx.onabort = () => reject(tx.error);
+    });
+    db.close();
+    assert.equal(text(await run(api, 0, 'old.json')), 'legacy');
+    assert.equal(JSON.parse(text(await run(api, 2))).find(e => e.name === 'old.json').size, 6);
+    await api.close();
+});
