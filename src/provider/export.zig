@@ -180,6 +180,9 @@ fn validateTree(io: std.Io, parent: std.Io.Dir, path: []const u8, root: bool) !v
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.ascii.eqlIgnoreCase(entry.name, export_marker)) return error.ReservedWebAsset;
+        if (root) for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png", @import("assets.zig").state_file }) |name| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name) and entry.kind != .file) return error.InvalidWebAssetDestination;
+        };
         switch (entry.kind) {
             .directory => try validateTree(io, dir, entry.name, false),
             .file => {},

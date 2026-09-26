@@ -332,9 +332,9 @@ fn handleConnection(
     // this; the plain-text body is the current build version, bumped by
     // the watcher thread after a successful rebuild. A changed value tells
     // the page to reload. Answered before static routing so the reserved
-    // path never hits the filesystem. Returns `0` when no watcher is
-    // running (a stray poll from a cached page won't ever reload).
-    if (std.mem.eql(u8, rel.?, livereload_rel)) {
+    // path never hits the filesystem while watching. Without a watcher,
+    // the route remains available to ordinary project assets.
+    if (watch_state != null and std.mem.eql(u8, rel.?, livereload_rel)) {
         const version = if (watch_state) |ws| ws.version.load(.acquire) else 0;
         var buf: [24]u8 = undefined;
         const vbody = std.fmt.bufPrint(&buf, "{d}", .{version}) catch "0";
@@ -470,7 +470,7 @@ fn resolvePath(raw_path: []const u8) ?[]const u8 {
     // one, and on Windows '\' is a path separator — so a target like
     // "/..\..\windows\win.ini" would otherwise be a single segment
     // that dodges the '..' check below and escapes `web_dir`.
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;
+    if (builtin.os.tag == .windows and std.mem.indexOfScalar(u8, path, '\\') != null) return null;
 
     path = path[1..]; // strip leading '/'
     if (path.len == 0) return "index.html";
@@ -1513,7 +1513,11 @@ test "resolveTarget: rejects parent traversal" {
     try std.testing.expect(resolveTarget("/assets/../../secret") == null);
 }
 
-test "resolveTarget: rejects backslash (Windows separator traversal)" {
+test "resolveTarget: backslash is a separator only on Windows" {
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqualStrings("icon\\dark.png", resolveTarget("/icon\\dark.png").?);
+        return;
+    }
     // On Windows '\' is a path separator, so "/..\..\win.ini" would be
     // a single segment that dodges the '..' check. Reject any '\'.
     try std.testing.expect(resolveTarget("/..\\..\\windows\\win.ini") == null);

@@ -26,7 +26,7 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
             }
         }
     }
-    const project = if (project_web_path) |path| std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+    const project = if (project_web_path) |path| std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     } else null;
@@ -36,6 +36,20 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         for (copied.items) |entry| a.free(entry.path);
         copied.deinit(a);
     }
+    // Rebuild the overlay from a clean owned layer. Cleanup before copying
+    // handles file/directory changes, compressed replacements and Unicode
+    // case-only renames without guessing filesystem case-folding rules.
+    if (previous) |state| {
+        for (state.value.custom) |old| try removeStale(a, io, out, old.path, old.digest);
+        for (state.value.custom) |old| {
+            var parent = std.fs.path.dirname(old.path);
+            while (parent) |path| {
+                if (path.len == 0) break;
+                out.deleteDir(io, path) catch break; // preserve nonempty/backend parents
+                parent = std.fs.path.dirname(path);
+            }
+        }
+    }
     if (project) |dir| {
         const src_real = try dir.realPathFileAlloc(io, ".", a);
         defer a.free(src_real);
@@ -44,36 +58,6 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         if (within(out_real, src_real) or within(src_real, out_real)) return error.OverlappingShellDirectories;
         try copy(a, io, dir, out, "", &copied);
     }
-    var exact = std.StringHashMap(void).init(a);
-    defer exact.deinit();
-    var folded = std.StringHashMap([]const u8).init(a);
-    defer {
-        var keys = folded.keyIterator();
-        while (keys.next()) |key| a.free(key.*);
-        folded.deinit();
-    }
-    for (copied.items) |entry| {
-        try exact.put(entry.path, {});
-        const lower = try std.ascii.allocLowerString(a, entry.path);
-        const slot = folded.getOrPut(lower) catch |err| {
-            a.free(lower);
-            return err;
-        };
-        if (slot.found_existing) a.free(lower);
-        slot.value_ptr.* = entry.path;
-    }
-    if (previous) |state| for (state.value.custom) |old| {
-        if (exact.contains(old.path)) continue;
-        const lower = try std.ascii.allocLowerString(a, old.path);
-        defer a.free(lower);
-        // A case-only rename may still name the same file on this volume.
-        if (folded.get(lower)) |path| {
-            const old_stat = out.statFile(io, old.path, .{ .follow_symlinks = false }) catch null;
-            const new_stat = try out.statFile(io, path, .{ .follow_symlinks = false });
-            if (old_stat != null and old_stat.?.inode == new_stat.inode) continue;
-        }
-        try removeStale(a, io, out, old.path, old.digest);
-    };
     _ = try shell.stage(a, io, out, project);
     const rendered = (try optional(a, io, out, "index.html")).?;
     defer a.free(rendered);
@@ -87,7 +71,7 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
 /// Validate the complete custom overlay before any file or provenance changes.
 pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_path: ?[]const u8) !void {
     const path = project_path orelse return;
-    const src = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+    const src = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -99,7 +83,16 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
     const output = try dst.realPathFileAlloc(io, ".", a);
     defer a.free(output);
     if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
-    try validateCustom(io, src, dst, true);
+    var previous: ?std.json.Parsed(State) = null;
+    defer if (previous) |value| value.deinit();
+    var owned = std.StringHashMap([64]u8).init(a);
+    defer owned.deinit();
+    if (try optional(a, io, dst, state_file)) |saved| {
+        defer a.free(saved);
+        previous = try std.json.parseFromSlice(State, a, saved, .{ .allocate = .alloc_always });
+        for (previous.?.value.custom) |entry| try owned.put(entry.path, entry.digest);
+    }
+    try validateCustom(a, io, src, dst, "", &owned);
 }
 fn reserved(name: []const u8) bool {
     const base = compressedBase(name) orelse name;
@@ -108,7 +101,8 @@ fn reserved(name: []const u8) bool {
     }
     return false;
 }
-fn validateCustom(io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, root: bool) !void {
+fn validateCustom(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, prefix: []const u8, owned: *const std.StringHashMap([64]u8)) !void {
+    const root = prefix.len == 0;
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.mem.eql(u8, entry.name, "index.html")) {
@@ -116,8 +110,24 @@ fn validateCustom(io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, root: bool) !vo
             continue;
         }
         if (root and reserved(entry.name)) return error.ReservedWebAsset;
+        const path = try std.fs.path.join(a, &.{ prefix, entry.name });
+        defer a.free(path);
         switch (entry.kind) {
-            .file => if (dst) |dir| try regularOrMissing(io, dir, entry.name),
+            .file => if (dst) |dir| {
+                const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                if (st) |existing| switch (existing.kind) {
+                    .file => {},
+                    .directory => {
+                        const tree = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                        defer tree.close(io);
+                        if (!try ownedTreeOnly(a, io, tree, path, owned)) return error.InvalidWebAssetDestination;
+                    },
+                    else => return error.InvalidWebAssetDestination,
+                };
+            },
             .directory => {
                 const from = try src.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
                 defer from.close(io);
@@ -128,16 +138,48 @@ fn validateCustom(io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, root: bool) !vo
                         else => return err,
                     };
                     if (st) |existing| {
-                        if (existing.kind != .directory) return error.InvalidWebAssetDestination;
-                        to = try dir.openDir(io, entry.name, .{ .follow_symlinks = false });
+                        if (existing.kind == .directory) {
+                            to = try dir.openDir(io, entry.name, .{ .follow_symlinks = false });
+                        } else if (existing.kind != .file or !try ownedFile(io, dir, entry.name, path, owned)) return error.InvalidWebAssetDestination;
                     }
                 }
                 defer if (to) |dir| dir.close(io);
-                try validateCustom(io, from, to, false);
+                try validateCustom(a, io, from, to, path, owned);
             },
             else => return error.UnsupportedWebAsset,
         }
     }
+}
+
+fn ownedFile(io: std.Io, dir: std.Io.Dir, name: []const u8, path: []const u8, owned: *const std.StringHashMap([64]u8)) !bool {
+    const digest = owned.get(path) orelse return false;
+    return std.mem.eql(u8, &digest, &try hashFile(io, dir, name));
+}
+fn ownedTreeOnly(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, owned: *const std.StringHashMap([64]u8)) !bool {
+    var has_owned = false;
+    var keys = owned.keyIterator();
+    while (keys.next()) |key| {
+        if (within(key.*, prefix) and key.len > prefix.len) {
+            has_owned = true;
+            break;
+        }
+    }
+    if (!has_owned) return false;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const path = try std.fs.path.join(a, &.{ prefix, entry.name });
+        defer a.free(path);
+        switch (entry.kind) {
+            .file => if (!try ownedFile(io, dir, entry.name, path, owned)) return false,
+            .directory => {
+                const child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer child.close(io);
+                if (!try ownedTreeOnly(a, io, child, path, owned)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn compressedBase(name: []const u8) ?[]const u8 {
@@ -193,7 +235,7 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
                     else => return err,
                 }
                 try dst.createDirPath(io, entry.name);
-                const from = try src.openDir(io, entry.name, .{ .iterate = true });
+                const from = try src.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
                 defer from.close(io);
                 const to = try dst.openDir(io, entry.name, .{});
                 defer to.close(io);

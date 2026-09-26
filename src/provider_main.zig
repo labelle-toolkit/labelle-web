@@ -88,10 +88,10 @@ fn execute(init: std.process.Init) !void {
         // A source custom-page directory must survive even if it bears an export marker.
         const custom = try canonical(a, io, project_web);
         if (contains(out, custom) or contains(custom, out)) return error.DestructiveOutputPath;
-        try exporter.packageExport(a, web, project_web, .{ .output_dir = out, .zip = opts.zip, .platform = opts.platform });
+        try exporter.packageExport(init.gpa, web, project_web, .{ .output_dir = out, .zip = opts.zip, .platform = opts.platform });
     } else {
         if (opts.output != null or opts.zip or opts.platform != .none) return error.ExportOptionOnServe;
-        try assets.stage(a, io, web, project_web);
+        try assets.stage(init.gpa, io, web, project_web);
         if (std.mem.eql(u8, action, "serve")) {
             const port = opts.port orelse settings.port;
             if (port == 0) return error.InvalidPort;

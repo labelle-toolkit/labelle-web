@@ -39,6 +39,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
             assert result.returncode and fail in result.stderr, (result.returncode, result.stdout, result.stderr)
         else:
             assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+            assert 'leaked' not in result.stderr, result.stderr
         return result
     assert 'web export' in run('help').stderr
     # Old export shares the CLI run phase: it must refuse a server replacement.
@@ -93,6 +94,26 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     (web / '.labelle-export').write_text('input must not replace ownership')
     run('web', 'export', '--output=dist', fail='ReservedWebAsset')
     (web / '.labelle-export').unlink()
+    for name in ('index.html', 'labelle-loader.js', 'labelle-logo.png', '.labelle-shell-state.json'):
+        path = web / name
+        saved = path.read_bytes() if path.exists() else None
+        if path.exists():
+            path.unlink()
+        path.mkdir()
+        old_export = (dist / 'index.html').read_bytes()
+        run('web', 'export', '--output=dist', fail='InvalidWebAssetDestination')
+        assert (dist / 'index.html').read_bytes() == old_export
+        path.rmdir()
+        if saved is not None:
+            path.write_bytes(saved)
+    if os.name != 'nt':
+        external = project / 'external-source'
+        external.mkdir()
+        (external / 'private.txt').write_text('must not copy through a root symlink')
+        (project / 'web').symlink_to(external, target_is_directory=True)
+        run('web', 'export', '--output=dist', fail='labelle-web:')
+        assert not (dist / 'private.txt').exists()
+        (project / 'web').unlink()
     # Custom source stays untouched; relative page resources ship with it.
     custom = project / 'web'
     custom.mkdir()
@@ -172,6 +193,29 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     (custom / 'CaseAsset.txt').rename(custom / 'caseasset.txt')
     hook()
     assert (web / 'caseasset.txt').read_text() == 'case rename'
+    # Clear the owned layer before copying replacements, including shape changes.
+    (custom / 'changes-shape').write_text('file')
+    (custom / 'compressed-replacement').write_text('original')
+    (custom / 'É.txt').write_text('unicode case rename')
+    hook()
+    (custom / 'changes-shape').unlink()
+    (custom / 'changes-shape').mkdir()
+    (custom / 'changes-shape/config.json').write_text('{}')
+    (custom / 'compressed-replacement').unlink()
+    (custom / 'compressed-replacement.gz').write_bytes(b'standalone gzip')
+    (custom / 'É.txt').rename(custom / 'é.txt')
+    hook()
+    assert (web / 'changes-shape/config.json').read_text() == '{}'
+    assert (web / 'compressed-replacement.gz').read_bytes() == b'standalone gzip'
+    assert (web / 'é.txt').read_text() == 'unicode case rename'
+    (custom / 'changes-shape/config.json').unlink()
+    (custom / 'changes-shape').rmdir()
+    (custom / 'changes-shape').write_text('file again')
+    hook()
+    assert (web / 'changes-shape').read_text() == 'file again'
+    (custom / '__labelle_livereload').write_text('ordinary project asset')
+    if os.name != 'nt':
+        (custom / 'encoded\\asset.txt').write_text('POSIX asset')
     # Preflight is all-or-nothing for unsupported trees: no untracked partial overlay.
     (custom / 'ordinary-partial.txt').write_text('must not leak')
     (custom / 'GAME.JS').write_text('invalid reserved entry')
@@ -275,6 +319,9 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
                     raise AssertionError(log.read())
                 time.sleep(.1)
         assert response == source.replace('__WASM_BYTES__', '8')
+        assert urllib.request.urlopen(f'http://127.0.0.1:{port}/__labelle_livereload', timeout=3).read() == b'ordinary project asset'
+        if os.name != 'nt':
+            assert urllib.request.urlopen(f'http://127.0.0.1:{port}/encoded%5Casset.txt', timeout=3).read() == b'POSIX asset'
         if os.name != 'nt':
             # A new symlink introduced after startup cannot escape the served root.
             (web / 'escape.txt').symlink_to(project / 'project.labelle')
