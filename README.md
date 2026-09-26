@@ -4,7 +4,7 @@ Web platform package for the Labelle toolkit.
 
 ## Status
 
-Repository scaffold only. Provider commands and runtime services are not implemented or released yet. Do not add this repository as a working game dependency until the first usable release.
+IndexedDB blob storage is implemented in `src/web_storage.c` with Zig bindings in `src/web_storage.zig`. The backend adds the C source with its emscripten sysroot and imports the `storage` module. Runtime service selection remains explicit; provider commands are still scaffold work. This branch is unreleased.
 
 ## Planned responsibilities
 
