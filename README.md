@@ -143,7 +143,8 @@ Provider commands consume existing build output. They discover exactly one
 `game.js` and `game.wasm` are required with exactly that casing. Symlinked
 build artifacts are rejected before staging, serving, or export. Arguments use `--name=value` syntax;
 export platform is optional (`itch` or `github-pages`). GitHub Pages export
-adds `.nojekyll`. ZIP archives contain the final staged files.
+adds `.nojekyll`. ZIP archives contain the final staged files. The writer supports ZIP32
+(up to 65,535 entries and a 4 GiB archive); larger archives return `Zip64Required`.
 
 Project `web/` resources are copied alongside the selected page. Root filenames
 `game.js`, `game.wasm`, `game.data`, `.labelle-export`, `labelle-loader.js`, `labelle-logo.png` and

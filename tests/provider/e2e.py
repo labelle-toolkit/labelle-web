@@ -129,7 +129,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     # Reserved variants cannot truncate a runtime artifact on case-insensitive hosts.
     (custom / 'Game.WASM').write_bytes(b'bad overwrite')
     run('web', 'export', '--output=reserved', fail='ReservedWebAsset')
-    assert (project / 'reserved/game.wasm').read_bytes() == wasm
+    assert not (project / 'reserved').exists()
+    assert (web / 'game.wasm').read_bytes() == wasm
     (custom / 'Game.WASM').unlink()
     run('web', 'export', '--output=.', fail='DestructiveOutputPath')
     run('web', 'export', '--output=web', fail='DestructiveOutputPath')
@@ -141,9 +142,12 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     # are independently covered in labelle-cli/test/provider_hooks_e2e.py.
     context = dict(contract_version='1.1.0', invocation=dict(kind='hook', id='shell', step='build', phase='after'), package_dir=str(repo), project_dir=str(project), target='wasm', lock_file=str(project / 'labelle.lock'), config_file=None, output_dir=str(web.parent), zig_executable=zig, optimize='Debug', progress='json')
     ctxfile = temp / 'context.json'
-    def hook():
+    def hook(fail=None):
         ctxfile.write_text(json.dumps(context))
         result = subprocess.run([exe], env=dict(env, LABELLE_CONTEXT=str(ctxfile)), cwd=project, capture_output=True, text=True, timeout=30)
+        if fail:
+            assert result.returncode != 0 and fail in result.stderr, result.stderr
+            return
         assert result.returncode == 0, result.stderr
         assert result.stdout == '', 'JSON progress mode must not emit non-protocol stdout'
     hook()
@@ -168,6 +172,41 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     (custom / 'CaseAsset.txt').rename(custom / 'caseasset.txt')
     hook()
     assert (web / 'caseasset.txt').read_text() == 'case rename'
+    # Preflight is all-or-nothing for unsupported trees: no untracked partial overlay.
+    (custom / 'ordinary-partial.txt').write_text('must not leak')
+    (custom / 'GAME.JS').write_text('invalid reserved entry')
+    previous_page = (web / 'index.html').read_bytes()
+    hook(fail='ReservedWebAsset')
+    assert not (web / 'ordinary-partial.txt').exists()
+    assert (web / 'index.html').read_bytes() == previous_page
+    (custom / 'ordinary-partial.txt').unlink()
+    (custom / 'GAME.JS').unlink()
+    # File-to-directory backend replacements survive removal of the custom source.
+    (custom / 'becomes-directory').write_text('old custom file')
+    hook()
+    (custom / 'becomes-directory').unlink()
+    (web / 'becomes-directory').unlink()
+    (web / 'becomes-directory').mkdir()
+    (web / 'becomes-directory/backend.txt').write_text('new backend directory')
+    hook()
+    assert (web / 'becomes-directory/backend.txt').read_text() == 'new backend directory'
+    if os.name != 'nt':
+        for name in ('icon:dark.png', 'icon\\dark.png'):
+            (custom / name).write_text('legal POSIX path')
+        hook()
+        for name in ('icon:dark.png', 'icon\\dark.png'):
+            (custom / name).unlink()
+        hook()
+        for name in ('icon:dark.png', 'icon\\dark.png'):
+            assert not (web / name).exists()
+    # Repeated large overlays use indexed lookups instead of pairwise path scans.
+    many = custom / 'many'
+    many.mkdir()
+    for n in range(1000):
+        (many / f'{n}.txt').write_text(str(n))
+    hook()
+    hook()
+    assert (web / 'many/999.txt').read_text() == '999'
     # Rebuilding/restaging after a custom page is removed restores the default.
     (custom / 'index.html').unlink()
     hook()

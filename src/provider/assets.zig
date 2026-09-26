@@ -6,6 +6,7 @@ const shell = @import("../shell.zig");
 
 /// Copy custom page resources and stamp the shell from its original source.
 pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_web_path: ?[]const u8) !void {
+    try preflight(a, io, output_path, project_web_path);
     const out = try std.Io.Dir.cwd().openDir(io, output_path, .{});
     defer out.close(io);
     // Reject output aliases before overwriting our owned files.
@@ -43,25 +44,35 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         if (within(out_real, src_real) or within(src_real, out_real)) return error.OverlappingShellDirectories;
         try copy(a, io, dir, out, "", &copied);
     }
+    var exact = std.StringHashMap(void).init(a);
+    defer exact.deinit();
+    var folded = std.StringHashMap([]const u8).init(a);
+    defer {
+        var keys = folded.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        folded.deinit();
+    }
+    for (copied.items) |entry| {
+        try exact.put(entry.path, {});
+        const lower = try std.ascii.allocLowerString(a, entry.path);
+        const slot = folded.getOrPut(lower) catch |err| {
+            a.free(lower);
+            return err;
+        };
+        if (slot.found_existing) a.free(lower);
+        slot.value_ptr.* = entry.path;
+    }
     if (previous) |state| for (state.value.custom) |old| {
-        var retained = false;
-        for (copied.items) |entry| {
-            if (std.mem.eql(u8, old.path, entry.path)) {
-                retained = true;
-                break;
-            }
-            // Case-only renames can refer to the same destination on a
-            // case-insensitive volume. Do not delete the freshly copied file.
-            if (std.ascii.eqlIgnoreCase(old.path, entry.path)) {
-                const old_stat = out.statFile(io, old.path, .{ .follow_symlinks = false }) catch continue;
-                const new_stat = try out.statFile(io, entry.path, .{ .follow_symlinks = false });
-                if (old_stat.inode == new_stat.inode) {
-                    retained = true;
-                    break;
-                }
-            }
+        if (exact.contains(old.path)) continue;
+        const lower = try std.ascii.allocLowerString(a, old.path);
+        defer a.free(lower);
+        // A case-only rename may still name the same file on this volume.
+        if (folded.get(lower)) |path| {
+            const old_stat = out.statFile(io, old.path, .{ .follow_symlinks = false }) catch null;
+            const new_stat = try out.statFile(io, path, .{ .follow_symlinks = false });
+            if (old_stat != null and old_stat.?.inode == new_stat.inode) continue;
         }
-        if (!retained) try removeStale(a, io, out, old.path, old.digest);
+        try removeStale(a, io, out, old.path, old.digest);
     };
     _ = try shell.stage(a, io, out, project);
     const rendered = (try optional(a, io, out, "index.html")).?;
@@ -71,6 +82,62 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
     try out.writeFile(io, .{ .sub_path = state_file, .data = saved });
     // Stamping/loader updates invalidate precompressed copies.
     for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png" }) |name| try invalidateCompressed(a, io, out, name);
+}
+
+/// Validate the complete custom overlay before any file or provenance changes.
+pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_path: ?[]const u8) !void {
+    const path = project_path orelse return;
+    const src = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer src.close(io);
+    const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{});
+    defer dst.close(io);
+    const source = try src.realPathFileAlloc(io, ".", a);
+    defer a.free(source);
+    const output = try dst.realPathFileAlloc(io, ".", a);
+    defer a.free(output);
+    if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
+    try validateCustom(io, src, dst, true);
+}
+fn reserved(name: []const u8) bool {
+    const base = compressedBase(name) orelse name;
+    for ([_][]const u8{ "game.js", "game.wasm", "game.data", ".labelle-export", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |owned| {
+        if (std.ascii.eqlIgnoreCase(base, owned)) return true;
+    }
+    return false;
+}
+fn validateCustom(io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, root: bool) !void {
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (root and std.mem.eql(u8, entry.name, "index.html")) {
+            if (entry.kind != .file) return error.UnsupportedWebAsset;
+            continue;
+        }
+        if (root and reserved(entry.name)) return error.ReservedWebAsset;
+        switch (entry.kind) {
+            .file => if (dst) |dir| try regularOrMissing(io, dir, entry.name),
+            .directory => {
+                const from = try src.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer from.close(io);
+                var to: ?std.Io.Dir = null;
+                if (dst) |dir| {
+                    const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                        error.FileNotFound => null,
+                        else => return err,
+                    };
+                    if (st) |existing| {
+                        if (existing.kind != .directory) return error.InvalidWebAssetDestination;
+                        to = try dir.openDir(io, entry.name, .{ .follow_symlinks = false });
+                    }
+                }
+                defer if (to) |dir| dir.close(io);
+                try validateCustom(io, from, to, false);
+            },
+            else => return error.UnsupportedWebAsset,
+        }
+    }
 }
 
 fn compressedBase(name: []const u8) ?[]const u8 {
@@ -98,10 +165,7 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.mem.eql(u8, entry.name, "index.html")) continue;
-        if (root) for ([_][]const u8{ "game.js", "game.wasm", "game.data", ".labelle-export", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |reserved| {
-            const name = compressedBase(entry.name) orelse entry.name;
-            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedWebAsset;
-        };
+        if (root and reserved(entry.name)) return error.ReservedWebAsset;
         switch (entry.kind) {
             .file => {
                 // The uncompressed source wins. Do not reintroduce an old
@@ -146,8 +210,8 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
 /// since staging; a differing digest belongs to that newer build and survives.
 /// Resolve one component at a time without following symlinks from stale state.
 fn removeStale(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, digest: [64]u8) !void {
-    if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, ':') != null) return error.InvalidAssetProvenance;
-    const sep = std.mem.indexOfAny(u8, path, "/\\");
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or (@import("builtin").os.tag == .windows and std.mem.indexOfScalar(u8, path, ':') != null)) return error.InvalidAssetProvenance;
+    const sep = std.mem.indexOfAny(u8, path, if (@import("builtin").os.tag == .windows) "/\\" else "/");
     const head = path[0 .. sep orelse path.len];
     if (head.len == 0 or std.mem.eql(u8, head, ".") or std.mem.eql(u8, head, "..")) return error.InvalidAssetProvenance;
     const st = dir.statFile(io, head, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -155,11 +219,13 @@ fn removeStale(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const 
         else => return err,
     };
     if (sep) |at| {
+        if (st.kind == .file) return; // a backend replaced the old parent tree
         if (st.kind != .directory) return error.InvalidWebAssetDestination;
         const child = try dir.openDir(io, head, .{ .follow_symlinks = false });
         defer child.close(io);
         return removeStale(a, io, child, path[at + 1 ..], digest);
     }
+    if (st.kind == .directory) return; // a backend replaced this custom file
     if (st.kind != .file) return error.InvalidWebAssetDestination;
     if (!std.mem.eql(u8, &digest, &try hashFile(io, dir, head))) return;
     try dir.deleteFile(io, head);

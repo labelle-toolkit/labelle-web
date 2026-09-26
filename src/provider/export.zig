@@ -60,6 +60,7 @@ pub fn packageExport(
     };
 
     try validateBuildTree(io, cwd, web_dir);
+    try @import("assets.zig").preflight(allocator, io, web_dir, project_web_dir);
 
     // Safety gate 1: refuse an output that names an existing regular FILE.
     // `outputDirIsUnsafe` can't see this (its `openDir` just fails), so the
@@ -467,6 +468,7 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
     }
     try collectRelFiles(allocator, io, output_dir, "", &entries);
 
+    try checkZip32(entries.items.len, 0);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -488,6 +490,8 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
         const zip_name = try toForwardSlash(allocator, rel);
         defer allocator.free(zip_name);
 
+        if (zip_name.len > std.math.maxInt(u16)) return error.Zip64Required;
+        try checkZip32(entries.items.len, @as(u64, buf.items.len) + 30 + zip_name.len + data.len);
         const crc = std.hash.crc.Crc32.hash(data);
         const size: u32 = @intCast(data.len);
         const offset: u32 = @intCast(buf.items.len);
@@ -508,6 +512,9 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
         });
     }
 
+    var final_size: u64 = @as(u64, buf.items.len) + 22;
+    for (central.items) |entry| final_size += 46 + entry.name.len;
+    try checkZip32(central.items.len, final_size);
     const cd_offset: u32 = @intCast(buf.items.len);
     for (central.items) |c| {
         try appendCentralHeader(allocator, &buf, c.name, c.crc, c.size, c.offset);
@@ -523,6 +530,17 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
     errdefer allocator.free(zip_path);
     try cwd.writeFile(io, .{ .sub_path = zip_path, .data = buf.items });
     return zip_path;
+}
+
+/// This writer emits ZIP32; fail normally before narrowing any header fields.
+fn checkZip32(entries: usize, bytes: u64) !void {
+    if (entries > std.math.maxInt(u16) or bytes > std.math.maxInt(u32)) return error.Zip64Required;
+}
+
+test "ZIP32 bounds reject oversized archives without narrowing" {
+    try checkZip32(65535, 0xffffffff);
+    try std.testing.expectError(error.Zip64Required, checkZip32(65536, 0));
+    try std.testing.expectError(error.Zip64Required, checkZip32(1, 0x100000000));
 }
 
 // DOS date/time for 1980-01-01 00:00 (a zero date is rejected by some
