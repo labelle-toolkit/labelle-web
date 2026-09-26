@@ -429,7 +429,6 @@ fn resolveTarget(target: []const u8) ?[]const u8 {
 
     path = path[1..]; // strip leading '/'
     if (path.len == 0) return "index.html";
-    if (std.mem.eql(u8, path, @import("assets.zig").state_file)) return null;
 
     // A second leading '/' (e.g. "//etc/passwd") would leave the path
     // absolute after the strip above and flow straight into
@@ -443,6 +442,9 @@ fn resolveTarget(target: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |seg| {
         if (std.mem.eql(u8, seg, "..")) return null;
+        // Match path components, including /./ aliases and case-insensitive
+        // host filesystems, so build-only page provenance never gets served.
+        if (std.ascii.eqlIgnoreCase(seg, @import("assets.zig").state_file)) return null;
     }
     return path;
 }
@@ -1433,6 +1435,12 @@ test "changedPaths: added, removed and changed paths, by key" {
     sig.mix("edit", 1, 2);
     sig.mix("new", 1, 1);
     try std.testing.expect(sig.eql(after.sig));
+}
+
+test "resolveTarget: hides shell provenance and path aliases" {
+    try std.testing.expect(resolveTarget("/.labelle-shell-state.json") == null);
+    try std.testing.expect(resolveTarget("/./.labelle-shell-state.json?cache=1") == null);
+    try std.testing.expect(resolveTarget("/.LABELLE-SHELL-STATE.JSON") == null);
 }
 
 test "resolveTarget: root maps to index.html" {

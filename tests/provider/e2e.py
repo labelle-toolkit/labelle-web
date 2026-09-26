@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import urllib.error
 import zipfile
 
 p = argparse.ArgumentParser()
@@ -125,6 +126,12 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
                     raise AssertionError(log.read())
                 time.sleep(.1)
         assert response == source.replace('__WASM_BYTES__', '8')
+        for hidden in ('.labelle-shell-state.json', './.labelle-shell-state.json', '.LABELLE-SHELL-STATE.JSON'):
+            try:
+                urllib.request.urlopen(f'http://127.0.0.1:{port}/{hidden}')
+                raise AssertionError('private staging metadata was served')
+            except urllib.error.HTTPError as error:
+                assert error.code in (400, 404), error.code
         assert urllib.request.urlopen(f'http://127.0.0.1:{port}/extra.js').read() == b'window.extra = true;'
     finally:
         if os.name == 'nt':
