@@ -116,11 +116,13 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
         }
         owned.legacy_directories = previous.?.value.schema < 2;
         for (previous.?.value.custom) |entry| {
+            try validateSavedPath(entry.path);
             try owned.files.put(entry.path, entry.digest);
             const st = dst.statFile(io, entry.path, .{ .follow_symlinks = false }) catch continue;
             if (st.kind == .file and st.nlink == 1 and std.mem.eql(u8, &entry.digest, &try hashFile(io, dst, entry.path))) try owned.file_ids.put(st.inode, {});
         }
         for (previous.?.value.directories) |path_name| {
+            try validateSavedPath(path_name);
             try owned.directories.put(path_name, {});
             const st = dst.statFile(io, path_name, .{ .follow_symlinks = false }) catch continue;
             if (st.kind == .directory) try owned.directory_ids.put(st.inode, {});
@@ -140,6 +142,23 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
     if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
     try validateCustom(a, io, src, dst, "", &owned);
 }
+// Provenance is input, not authority to remove runtime or source files.
+fn validateSavedPath(path: []const u8) !void {
+    const windows = @import("builtin").os.tag == .windows;
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null or (windows and std.mem.indexOfScalar(u8, path, ':') != null)) return error.InvalidAssetProvenance;
+    var parts = std.mem.splitAny(u8, path, if (windows) "/\\" else "/");
+    var root = true;
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or (root and reserved(part))) return error.InvalidAssetProvenance;
+        root = false;
+    }
+}
+test "saved paths cannot claim reserved artifacts or escape staging" {
+    for ([_][]const u8{ "game.js", "GAME.WASM", "game.js.gz", "index.html", ".labelle-export", "../outside", "a/../game.js", "a//b", "a/", "./ordinary" }) |path| try std.testing.expectError(error.InvalidAssetProvenance, validateSavedPath(path));
+    try validateSavedPath("config/.labelle-shell-state.json");
+    try validateSavedPath("textures/a.png");
+}
+
 fn reserved(name: []const u8) bool {
     const base = compressedBase(name) orelse name;
     for ([_][]const u8{ "game.js", "game.wasm", "game.data", ".labelle-export", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |owned| {

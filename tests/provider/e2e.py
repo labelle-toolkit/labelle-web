@@ -1,5 +1,6 @@
 """Real CLI command dispatch plus provider wire hooks, exports and HTTP serving."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,18 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert (dist / 'labelle-loader.js').is_file()
     with zipfile.ZipFile(project / 'dist.zip') as archive:
         assert archive.read('index.html') == (dist / 'index.html').read_bytes()
+    # Owned archive bytes do not grant permission to overwrite another hard link.
+    archive_before = (project / 'dist.zip').read_bytes()
+    page_before = (dist / 'index.html').read_bytes()
+    os.link(project / 'dist.zip', project / 'backup.zip')
+    run('web', 'export', '--output=dist', '--zip', fail='DestructiveArchivePath')
+    assert (project / 'backup.zip').read_bytes() == archive_before
+    assert (dist / 'index.html').read_bytes() == page_before
+    (project / 'backup.zip').unlink()
+    (web / '.nojekyll').mkdir()
+    run('web', 'export', '--output=dist', '--platform=github-pages', fail='InvalidPagesMarker')
+    assert (dist / 'index.html').read_bytes() == page_before
+    (web / '.nojekyll').rmdir()
     # Source paths are protected before they exist, not only after realpath succeeds.
     run('web', 'export', '--output=web', fail='DestructiveOutputPath')
     run('web', 'export', '--output=web/new', fail='DestructiveOutputPath')
@@ -122,6 +135,10 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     # Custom source stays untouched; relative page resources ship with it.
     custom = project / 'web'
     custom.mkdir()
+    (custom / '.nojekyll').mkdir()
+    run('web', 'export', '--output=dist', '--platform=github-pages', fail='InvalidPagesMarker')
+    assert (dist / 'index.html').read_bytes() == page_before
+    (custom / '.nojekyll').rmdir()
     source = '<!doctype html><title>Custom</title><div data-wasm-bytes="__WASM_BYTES__"></div><script src="extra.js"></script>'
     (custom / 'index.html').write_text(source)
     (custom / 'extra.js').write_text('window.extra = true;')
@@ -304,6 +321,18 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     hook()
     assert 'data-wasm-bytes="8"' in (project / 'bundle/index.html').read_text()
     assert not (project / 'bundle/.labelle-shell-state.json').exists()
+    # Matching digests cannot let a saved ownership record delete runtime files.
+    state_path = web / '.labelle-shell-state.json'
+    safe_state = state_path.read_bytes()
+    for reserved in ('game.js', 'game.wasm'):
+        artifact = (web / reserved).read_bytes()
+        poisoned = json.loads(safe_state)
+        poisoned['custom'].append(dict(path=reserved, digest=list(hashlib.sha256(artifact).hexdigest().encode())))
+        state_path.write_text(json.dumps(poisoned))
+        hook(fail='InvalidAssetProvenance')
+        assert (web / reserved).read_bytes() == artifact
+        assert (project / 'bundle/index.html').exists()
+    state_path.write_bytes(safe_state)
     # Corrupt provenance must preserve an existing release even without web/.
     state_path = web / '.labelle-shell-state.json'
     saved_state = state_path.read_bytes()

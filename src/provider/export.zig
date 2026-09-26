@@ -61,6 +61,10 @@ pub fn packageExport(
 
     try validateBuildTree(io, cwd, web_dir);
     try @import("assets.zig").preflight(allocator, io, web_dir, project_web_dir);
+    if (opts.platform == .github_pages) {
+        try validatePagesMarker(allocator, io, web_dir);
+        if (project_web_dir) |custom| try validatePagesMarker(allocator, io, custom);
+    }
 
     // Safety gate 1: refuse an output that names an existing regular FILE.
     // `outputDirIsUnsafe` can't see this (its `openDir` just fails), so the
@@ -233,6 +237,15 @@ fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
     hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
 }
+fn validatePagesMarker(a: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    const path = try std.fs.path.join(a, &.{ root, ".nojekyll" });
+    defer a.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind != .file) return error.InvalidPagesMarker;
+}
 fn checkArchiveDestination(a: std.mem.Allocator, io: std.Io, output: []const u8, ownership: Ownership) !void {
     const path = try std.fmt.allocPrint(a, "{s}.zip", .{trimTrailingSeps(output)});
     defer a.free(path);
@@ -240,7 +253,7 @@ fn checkArchiveDestination(a: std.mem.Allocator, io: std.Io, output: []const u8,
         error.FileNotFound => return,
         else => return err,
     };
-    if (stat.kind != .file) return error.DestructiveArchivePath;
+    if (stat.kind != .file or stat.nlink > 1) return error.DestructiveArchivePath;
     const expected = ownership.zip_sha256 orelse return error.DestructiveArchivePath;
     if (!std.mem.eql(u8, &expected, &try hashFile(io, path))) return error.DestructiveArchivePath;
 }
