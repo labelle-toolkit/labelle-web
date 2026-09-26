@@ -114,7 +114,9 @@
     module.labelleLoader = { fail, dispose() { cancelAnimationFrame(frame); } };
     if (canvas) canvas.addEventListener('contextmenu', event => event.preventDefault());
     progress();
-    if (options.fitCanvas !== false) fit();
+    // Custom canvases may size themselves from their backing attributes.
+    // Fitting is opt-in and requires an independent CSS box (as in index.html).
+    if (options.fitCanvas === true) fit();
     return module;
   }
   global.LabelleLoader = { install };

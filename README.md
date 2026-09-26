@@ -85,11 +85,17 @@ Load `labelle-loader.js` before `game.js`, then configure the existing Module:
 ```
 
 Your page supplies its own styles and canvas (the default page is an example).
+For loader-script download failures, copy the inline `labelleShellFail` fallback
+and guarded game-script startup from `src/shell/index.html`; that fallback works
+even when `LabelleLoader` is unavailable.
 Existing `onRuntimeInitialized`, `onAbort` and `locateFile` callbacks are retained.
 The loader owns `instantiateWasm`; installation rejects an existing override.
 Options include `wasmURL` (otherwise `locateFile('game.wasm', scriptDirectory)` or
 `game.wasm`), `scriptDirectory`, `wasmBytes` (overrides the data attribute),
-`fitCanvas: false` and `onError`. URLs resolve relative to the document; pass an
+`fitCanvas: true` and `onError`. Canvas fitting is **off by default** for custom
+pages: enable it only when CSS supplies width and height independently of the
+canvas backing attributes (for example, `width: 100vw; height: 100dvh`). The
+default shell supplies that CSS and explicitly enables fitting. URLs resolve relative to the document; pass an
 explicit URL/prefix for CDN/subdirectory glue. `Module.labelleLoader.dispose()`
 stops canvas fitting when a custom page removes the game. This hook supports
 classic Emscripten `Module` builds, not modularized factories/ES modules or

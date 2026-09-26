@@ -57,6 +57,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           res.setHeader('Content-Type', 'text/html');
           res.end(mode === 'unknown' ? html.toString().replace(`data-wasm-bytes="${wasm.length}"`, 'data-wasm-bytes="0"') : html);
         } else if (file === 'labelle-loader.js') {
+          if (mode === 'loader-failure') { res.writeHead(404); res.end(); return; }
           res.setHeader('Content-Type', 'text/javascript'); res.end(js);
         } else if (file === 'labelle-logo.png') {
           res.setHeader('Content-Type', 'image/png'); res.end(logo);
@@ -120,7 +121,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           } finally { await page.close(); }
         });
       }
-      for (const mode of ['http-failure', 'compile-failure', 'js-failure', 'stream-failure']) {
+      for (const mode of ['http-failure', 'compile-failure', 'js-failure', 'stream-failure', 'loader-failure']) {
         await t.test(mode + ': readable error and no hidden loader', async () => {
           const { page, errors } = await pageFor(mode);
           try {
@@ -159,6 +160,21 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
         try {
           await page.waitForFunction(() => document.querySelector('#loading').classList.contains('failed'));
           assert.deepEqual(errors, []);
+        } finally { await page.close(); }
+      });
+      await t.test('custom intrinsic canvas does not grow at high DPR', async () => {
+        const page = await browser.newPage({ deviceScaleFactor: 2 });
+        try {
+          await page.setContent('<canvas id="custom"></canvas>');
+          await page.addScriptTag({ content: js.toString() });
+          const sizes = await page.evaluate(async () => {
+            const canvas = document.getElementById('custom');
+            const before = [canvas.width, canvas.height, canvas.clientWidth, canvas.clientHeight];
+            LabelleLoader.install({}, { canvas });
+            for (let i = 0; i < 10; i++) await new Promise(requestAnimationFrame);
+            return [before, [canvas.width, canvas.height, canvas.clientWidth, canvas.clientHeight]];
+          });
+          assert.deepEqual(sizes[0], sizes[1]);
         } finally { await page.close(); }
       });
       if (realDir) await t.test('actual emcc glue reaches main', async () => {

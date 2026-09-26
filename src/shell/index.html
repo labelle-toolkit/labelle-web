@@ -28,15 +28,34 @@
     <progress id="loading-progress" max="1" aria-label="Downloading game"></progress>
     <p id="loading-status" role="status">Loading game…</p>
   </div>
-  <script src="labelle-loader.js"></script>
   <script>
-    var Module = LabelleLoader.install(window.Module || {}, {
-      canvas: document.getElementById('canvas'),
-      overlay: document.getElementById('loading'),
-      progress: document.getElementById('loading-progress'),
-      status: document.getElementById('loading-status')
-    });
+    function labelleShellFail() {
+      var overlay = document.getElementById('loading');
+      overlay.classList.add('failed');
+      overlay.setAttribute('aria-busy', 'false');
+      document.getElementById('loading-progress').hidden = true;
+      var status = document.getElementById('loading-status');
+      status.setAttribute('role', 'alert');
+      status.textContent = 'Could not load the game. Check your connection and reload the page.';
+    }
   </script>
-  <script src="game.js" onerror="Module.labelleLoader.fail(new Error('Could not download game.js'))"></script>
+  <script src="labelle-loader.js" onerror="labelleShellFail()"></script>
+  <script>
+    if (window.LabelleLoader) {
+      var Module = LabelleLoader.install(window.Module || {}, {
+        canvas: document.getElementById('canvas'),
+        overlay: document.getElementById('loading'),
+        progress: document.getElementById('loading-progress'),
+        status: document.getElementById('loading-status'),
+        fitCanvas: true // The viewport CSS above is independent of buffer size.
+      });
+      var gameScript = document.createElement('script');
+      gameScript.src = 'game.js';
+      gameScript.onerror = function () { Module.labelleLoader.fail(new Error('Could not download game.js')); };
+      document.body.appendChild(gameScript);
+    } else {
+      labelleShellFail();
+    }
+  </script>
 </body>
 </html>
