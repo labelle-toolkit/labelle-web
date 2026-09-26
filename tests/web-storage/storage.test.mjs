@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { IDBFactory } from 'fake-indexeddb';
+import { IDBFactory, forceCloseDatabase } from 'fake-indexeddb';
 
 // Test the actual EM_JS implementation, not a parallel JS copy.
 const source = readFileSync(new URL('../../src/web_storage.c', import.meta.url), 'utf8');
@@ -25,6 +25,26 @@ async function run(api, kind, name = '', data = new Uint8Array(), limit = 1e6) {
     api.release(id);
     return result;
 }
+
+test('abnormal database close evicts the connection and subsequent operations reopen', async () => {
+    const idb = new IDBFactory();
+    let connection;
+    let opens = 0;
+    const api = create({ open(...args) {
+        opens++;
+        const request = idb.open(...args);
+        request.addEventListener('success', () => { connection = request.result; });
+        return request;
+    } });
+    await run(api, 1, 'a.json', bytes('before'));
+    forceCloseDatabase(connection);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await run(api, 1, 'b.json', bytes('after'));
+    assert.equal(text(await run(api, 0, 'a.json')), 'before');
+    assert.equal(text(await run(api, 0, 'b.json')), 'after');
+    assert.equal(opens, 2);
+    await api.close();
+});
 
 test('multiple saves, copied input, reopen/reload, overwrite, sidecars, list and delete', async () => {
     const idb = new IDBFactory();

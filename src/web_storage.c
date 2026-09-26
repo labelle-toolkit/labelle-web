@@ -27,7 +27,9 @@ EM_JS(void, labelle_blob_init_js, (), {
                 request.onsuccess = () => {
                     const db = request.result;
                     if (blocked) { db.close(); return; }
-                    db.onversionchange = () => { db.close(); databases.delete(namespace); };
+                    const evict = () => { if (databases.get(namespace) === promise) databases.delete(namespace); };
+                    db.onversionchange = () => { db.close(); evict(); };
+                    db.onclose = evict;
                     resolve(db);
                 };
             });
