@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import zipfile
 
 p = argparse.ArgumentParser()
@@ -60,6 +61,31 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert (dist / 'index.html').read_text() == source.replace('__WASM_BYTES__', '8')
     assert (custom / 'index.html').read_text() == source
     assert (dist / 'extra.js').read_text() == 'window.extra = true;'
+    # Custom files invalidate every compressed sibling, regardless of copy order.
+    (web / 'extra.js.gz').write_bytes(b'old build compression')
+    (custom / 'extra.js.br').write_bytes(b'old source compression')
+    (custom / 'café image.txt').write_text('unicode resource')
+    run('web', 'export', '--output=dist', '--zip')
+    assert not (dist / 'extra.js.gz').exists() and not (dist / 'extra.js.br').exists()
+    with zipfile.ZipFile(project / 'dist.zip') as archive:
+        assert archive.read('café image.txt') == b'unicode resource'
+    # Existing exports may replace their own archive; unrelated/replaced files survive.
+    (project / 'unrelated.zip').write_bytes(b'keep unrelated archive')
+    run('web', 'export', '--output=unrelated', '--zip', fail='DestructiveArchivePath')
+    assert not (project / 'unrelated').exists()
+    assert (project / 'unrelated.zip').read_bytes() == b'keep unrelated archive'
+    previous_zip = (project / 'dist.zip').read_bytes()
+    previous_html = (dist / 'index.html').read_bytes()
+    (project / 'dist.zip').write_bytes(b'replaced archive')
+    run('web', 'export', '--output=dist', '--zip', fail='DestructiveArchivePath')
+    assert (project / 'dist.zip').read_bytes() == b'replaced archive'
+    assert (dist / 'index.html').read_bytes() == previous_html
+    (project / 'dist.zip').write_bytes(previous_zip)
+    # Reserved variants cannot truncate a runtime artifact on case-insensitive hosts.
+    (custom / 'Game.WASM').write_bytes(b'bad overwrite')
+    run('web', 'export', '--output=reserved', fail='ReservedWebAsset')
+    assert (project / 'reserved/game.wasm').read_bytes() == wasm
+    (custom / 'Game.WASM').unlink()
     run('web', 'export', '--output=.', fail='DestructiveOutputPath')
     run('web', 'export', '--output=web', fail='DestructiveOutputPath')
     (project / 'user-data').mkdir()
@@ -87,6 +113,19 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     hook()
     assert 'data-wasm-bytes="8"' in (project / 'bundle/index.html').read_text()
     assert not (project / 'bundle/.labelle-shell-state.json').exists()
+    # JSON escaping may make provenance larger than the supported source HTML.
+    context.update(invocation=dict(kind='hook', id='shell', step='build', phase='after'), output_dir=str(web.parent))
+    large_page = '"' * (9 * 1024 * 1024)
+    (web / 'index.html').write_text(large_page)
+    hook()
+    assert (web / '.labelle-shell-state.json').stat().st_size > 16 * 1024 * 1024
+    hook()
+    (custom / 'index.html').unlink()
+    hook()
+    assert (web / 'index.html').read_text() == large_page
+    (web / 'index.html').unlink()
+    (web / '.labelle-shell-state.json').unlink()
+    (custom / 'index.html').write_text(source)
     # A controlled optimizer changes the shipped length: size stamping must
     # follow that transform, and stale compressed siblings must be removed.
     if os.name != 'nt':
@@ -126,9 +165,10 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
                     raise AssertionError(log.read())
                 time.sleep(.1)
         assert response == source.replace('__WASM_BYTES__', '8')
-        for hidden in ('.labelle-shell-state.json', './.labelle-shell-state.json', '.LABELLE-SHELL-STATE.JSON'):
+        assert urllib.request.urlopen(f'http://127.0.0.1:{port}/' + urllib.parse.quote('café image.txt'), timeout=3).read() == b'unicode resource'
+        for hidden in ('.labelle-shell-state.json', './.labelle-shell-state.json', '.LABELLE-SHELL-STATE.JSON', '%2elabelle-shell-state.json', '%2e%2e/project.labelle', '%5c..%5cproject.labelle'):
             try:
-                urllib.request.urlopen(f'http://127.0.0.1:{port}/{hidden}')
+                urllib.request.urlopen(f'http://127.0.0.1:{port}/{hidden}', timeout=3)
                 raise AssertionError('private staging metadata was served')
             except urllib.error.HTTPError as error:
                 assert error.code in (400, 404), error.code

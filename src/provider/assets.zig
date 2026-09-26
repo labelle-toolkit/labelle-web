@@ -44,15 +44,21 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
     defer a.free(saved);
     try out.writeFile(io, .{ .sub_path = state_file, .data = saved });
     // Stamping/loader updates invalidate precompressed copies.
-    for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png" }) |name| {
-        for ([_][]const u8{ ".gz", ".br" }) |ext| {
-            const path = try std.mem.concat(a, u8, &.{ name, ext });
-            defer a.free(path);
-            out.deleteFile(io, path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-        }
+    for ([_][]const u8{ "index.html", "labelle-loader.js", "labelle-logo.png" }) |name| try invalidateCompressed(a, io, out, name);
+}
+
+fn compressedBase(name: []const u8) ?[]const u8 {
+    if (std.ascii.endsWithIgnoreCase(name, ".gz") or std.ascii.endsWithIgnoreCase(name, ".br")) return name[0 .. name.len - 3];
+    return null;
+}
+fn invalidateCompressed(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
+    for ([_][]const u8{ ".gz", ".br" }) |ext| {
+        const path = try std.mem.concat(a, u8, &.{ name, ext });
+        defer a.free(path);
+        dir.deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
     }
 }
 
@@ -65,13 +71,25 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, root
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.mem.eql(u8, entry.name, "index.html")) continue;
-        if (root) for ([_][]const u8{ "game.js", "game.wasm", "game.data", "labelle-loader.js", "labelle-logo.png", state_file }) |reserved| {
-            if (std.mem.eql(u8, entry.name, reserved)) return error.ReservedWebAsset;
+        if (root) for ([_][]const u8{ "game.js", "game.wasm", "game.data", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |reserved| {
+            const name = compressedBase(entry.name) orelse entry.name;
+            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedWebAsset;
         };
         switch (entry.kind) {
             .file => {
+                // The uncompressed source wins. Do not reintroduce an old
+                // sibling later merely because directory iteration saw it last.
+                if (compressedBase(entry.name)) |base| {
+                    if (src.statFile(io, base, .{})) |st| {
+                        if (st.kind == .file) continue;
+                    } else |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    }
+                }
                 try regularOrMissing(io, dst, entry.name);
                 try src.copyFile(entry.name, dst, entry.name, io, .{});
+                try invalidateCompressed(a, io, dst, entry.name);
             },
             .directory => {
                 if (dst.statFile(io, entry.name, .{ .follow_symlinks = false })) |st| {
@@ -106,7 +124,7 @@ fn regularOrMissing(io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
     }
 }
 fn optional(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) !?[]u8 {
-    return dir.readFileAlloc(io, name, a, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+    return dir.readFileAlloc(io, name, a, .limited(if (std.mem.eql(u8, name, state_file)) 6 * 16 * 1024 * 1024 + 1024 else 16 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };

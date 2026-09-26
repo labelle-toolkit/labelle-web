@@ -144,11 +144,15 @@ adds `.nojekyll`. ZIP archives contain the final staged files.
 
 Project `web/` resources are copied alongside the selected page. Root filenames
 `game.js`, `game.wasm`, `game.data`, `labelle-loader.js`, `labelle-logo.png` and
-`.labelle-shell-state.json` are reserved; custom assets cannot replace them.
-Exports run optional `wasm-opt` before size stamping, invalidate stale compressed
+`.labelle-shell-state.json` are reserved (including case variants and compressed siblings); custom assets
+cannot replace them.
+Precompressed custom files are ignored when the original file is present;
+regenerate compression after export. Exports run optional `wasm-opt` before size stamping, invalidate stale compressed
 copies of changed artifacts, and report the shipped tree. Destination paths
 cannot overlap inputs or replace the project/custom-page directory; unrelated
-nonempty directories are refused.
+nonempty directories are refused. An existing ZIP is replaced only when its
+SHA-256 matches the ownership record from an earlier export; unrelated or
+modified neighboring archives are refused before the output directory changes.
 
 Map a provider-owned JSON file in `project.labelle` when hooks need settings:
 

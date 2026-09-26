@@ -317,7 +317,12 @@ fn handleConnection(
         return;
     }
 
-    const rel = resolveTarget(request.head.target);
+    // Strip URL query/fragment before decoding; an encoded '?' belongs to
+    // the filename. Validate the decoded path so encoded traversal is refused.
+    const path_end = std.mem.indexOfAny(u8, request.head.target, "?#") orelse request.head.target.len;
+    const encoded = try allocator.dupe(u8, request.head.target[0..path_end]);
+    defer allocator.free(encoded);
+    const rel = resolvePath(std.Uri.percentDecodeInPlace(encoded));
     if (rel == null) {
         try request.respond("400 Bad Request\n", .{ .status = .bad_request });
         return;
@@ -419,6 +424,11 @@ fn resolveTarget(target: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
     if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
 
+    return resolvePath(path);
+}
+
+fn resolvePath(raw_path: []const u8) ?[]const u8 {
+    var path = raw_path;
     if (path.len == 0 or path[0] != '/') return null;
 
     // Reject any backslash outright. A legit web asset path never has

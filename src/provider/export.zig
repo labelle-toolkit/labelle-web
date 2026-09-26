@@ -99,6 +99,11 @@ pub fn packageExport(
         return error.DestructiveOutputPath;
     }
 
+    // A neighboring archive is a separate destination. Only overwrite bytes
+    // whose digest matches the previous export's private ownership record.
+    const ownership = try readOwnership(allocator, io, opts.output_dir);
+    if (opts.zip) try checkArchiveDestination(allocator, io, opts.output_dir, ownership);
+
     // Fresh output dir — never leak stale files from a prior export. A wipe
     // failure is fatal: proceeding would blend stale files into the release.
     cwd.deleteTree(io, opts.output_dir) catch |err| {
@@ -113,7 +118,7 @@ pub fn packageExport(
     // recognized as ours on the next run (and excluded from the archive).
     const marker_path = try std.fs.path.join(allocator, &.{ opts.output_dir, export_marker });
     defer allocator.free(marker_path);
-    cwd.writeFile(io, .{ .sub_path = marker_path, .data = "labelle web export output dir\n" }) catch {};
+    try writeOwnership(allocator, io, marker_path, ownership);
 
     // 1. Copy the whole web tree.
     var files: std.ArrayList(FileReport) = .empty;
@@ -151,12 +156,61 @@ pub fn packageExport(
     defer if (zip_path) |p| allocator.free(p);
     if (opts.zip) {
         zip_path = try writeZipArchive(allocator, io, opts.output_dir);
+        try writeOwnership(allocator, io, marker_path, .{ .zip_sha256 = try hashFile(io, zip_path.?) });
     }
 
     // Report the shipped tree, including custom assets and excluding removed
     // compressed/provenance files. Keep original wasm sizes for savings.
     try refreshReport(allocator, io, opts.output_dir, &files);
     printReport(files.items, opts, wasm_opt_ran, zip_path);
+}
+
+const Ownership = struct { zip_sha256: ?[64]u8 = null };
+
+fn readOwnership(a: std.mem.Allocator, io: std.Io, output: []const u8) !Ownership {
+    const path = try std.fs.path.join(a, &.{ output, export_marker });
+    defer a.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return .{},
+        else => return err,
+    };
+    defer a.free(data);
+    // Old text-only markers do not establish ownership of an adjacent ZIP.
+    const parsed = std.json.parseFromSlice(Ownership, a, data, .{}) catch return .{};
+    defer parsed.deinit();
+    return parsed.value;
+}
+fn writeOwnership(a: std.mem.Allocator, io: std.Io, marker: []const u8, value: Ownership) !void {
+    const data = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(data);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = data });
+}
+fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    var chunk: [8192]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    while (true) {
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+fn checkArchiveDestination(a: std.mem.Allocator, io: std.Io, output: []const u8, ownership: Ownership) !void {
+    const path = try std.fmt.allocPrint(a, "{s}.zip", .{trimTrailingSeps(output)});
+    defer a.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind != .file) return error.DestructiveArchivePath;
+    const expected = ownership.zip_sha256 orelse return error.DestructiveArchivePath;
+    if (!std.mem.eql(u8, &expected, &try hashFile(io, path))) return error.DestructiveArchivePath;
 }
 
 fn refreshReport(a: std.mem.Allocator, io: std.Io, root: []const u8, files: *std.ArrayList(FileReport)) !void {
@@ -444,7 +498,7 @@ fn appendU32(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !voi
 fn appendLocalHeader(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, crc: u32, size: u32) !void {
     try buf.appendSlice(allocator, &std.zip.local_file_header_sig);
     try appendU16(allocator, buf, 20); // version needed
-    try appendU16(allocator, buf, 0); // flags
+    try appendU16(allocator, buf, 1 << 11); // UTF-8 filenames
     try appendU16(allocator, buf, 0); // method: store
     try appendU16(allocator, buf, dos_time);
     try appendU16(allocator, buf, dos_date);
@@ -459,7 +513,7 @@ fn appendCentralHeader(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), na
     try buf.appendSlice(allocator, &std.zip.central_file_header_sig);
     try appendU16(allocator, buf, 20); // version made by
     try appendU16(allocator, buf, 20); // version needed
-    try appendU16(allocator, buf, 0); // flags
+    try appendU16(allocator, buf, 1 << 11); // UTF-8 filenames
     try appendU16(allocator, buf, 0); // method: store
     try appendU16(allocator, buf, dos_time);
     try appendU16(allocator, buf, dos_date);
