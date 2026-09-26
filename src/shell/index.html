@@ -29,6 +29,7 @@
     <p id="loading-status" role="status">Loading game…</p>
   </div>
   <script>
+    /** Report failure even when the external loader itself is unavailable. */
     function labelleShellFail() {
       var overlay = document.getElementById('loading');
       overlay.classList.add('failed');

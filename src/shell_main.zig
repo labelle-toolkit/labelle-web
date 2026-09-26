@@ -2,6 +2,7 @@
 const std = @import("std");
 const shell = @import("shell.zig");
 
+/// Stage one existing web build, optionally taking its original custom page.
 pub fn main(init: std.process.Init) !u8 {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.arena.allocator());
     defer args.deinit();

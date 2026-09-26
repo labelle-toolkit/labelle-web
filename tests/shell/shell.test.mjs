@@ -12,6 +12,7 @@ import { randomBytes } from 'node:crypto';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const tool = process.env.SHELL_TOOL || join(root, 'zig-out', 'bin', process.platform === 'win32' ? 'labelle-web-shell.exe' : 'labelle-web-shell');
+/** Encode the unsigned section length for the valid wasm test payload. */
 function leb(n) {
   const bytes = [];
   do { const b = n & 127; n >>>= 7; bytes.push(b | (n ? 128 : 0)); } while (n);
@@ -63,7 +64,10 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           res.setHeader('Content-Type', 'image/png'); res.end(logo);
         } else if (file === 'game.js') {
           if (mode === 'js-failure') { res.writeHead(404); res.end(); return; }
-          res.setHeader('Content-Type', 'text/javascript'); res.end(fixtureJS);
+          res.setHeader('Content-Type', 'text/javascript');
+          if (mode === 'js-syntax') res.end('function (');
+          else if (mode === 'js-throw') res.end('throw new Error("startup execution failed");');
+          else res.end(fixtureJS);
         } else if (file === 'game.wasm' || file === 'relocated.wasm') {
           if (mode === 'http-failure') { res.writeHead(503); res.end('unavailable'); return; }
           if (mode === 'compile-failure') { res.end('not wasm'); return; }
@@ -83,6 +87,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       const base = `http://127.0.0.1:${server.address().port}`;
       browser = await browsers[name].launch({ headless: true });
+      /** Open an isolated page with optional startup hooks and error capture. */
       async function pageFor(mode, init) {
         const page = await browser.newPage({ viewport: { width: 800, height: 600 }, deviceScaleFactor: 2 });
         const errors = [];
@@ -133,6 +138,26 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           } finally { await page.close(); }
         });
       }
+      for (const mode of ['js-syntax', 'js-throw']) {
+        await t.test(mode + ': execution error fails the loading UI', async () => {
+          const { page, errors } = await pageFor(mode);
+          try {
+            await page.waitForFunction(() => document.querySelector('#loading').classList.contains('failed'));
+            assert.equal(await page.locator('#loading').isVisible(), true);
+            assert.match(await page.locator('[role=alert]').textContent(), /Could not load/);
+            assert.equal(errors.length, 1, 'the intentional execution error remains observable');
+          } finally { await page.close(); }
+        });
+      }
+      await t.test('successful startup removes its temporary error listener', async () => {
+        const { page, errors } = await pageFor('slow');
+        try {
+          await page.waitForFunction(() => window.gameReady);
+          await page.evaluate(() => window.dispatchEvent(new ErrorEvent('error', { message: 'later game error' })));
+          assert.equal(await page.locator('#loading').isVisible(), false);
+          assert.deepEqual(errors, []);
+        } finally { await page.close(); }
+      });
       await t.test('custom hooks, locateFile, runtime abort, and backend size reset', async () => {
         const { page, errors } = await pageFor('slow', () => {
           window.Module = {

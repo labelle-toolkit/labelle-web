@@ -2,6 +2,7 @@
 (function (global) {
   'use strict';
 
+  /** Install classic Emscripten startup hooks; optional canvas fitting needs CSS dimensions. */
   function install(module, options) {
     options = options || {};
     if (module.instantiateWasm) throw new Error('Module.instantiateWasm is already configured');
@@ -17,9 +18,11 @@
     const previousReady = module.onRuntimeInitialized;
     const previousAbort = module.onAbort;
 
+    /** Format decompressed byte counts independently of hosting compression. */
     function bytes(n) {
       return n.toLocaleString('en-US') + ' bytes';
     }
+    /** Refresh determinate or indeterminate UI without changing failure state. */
     function progress() {
       if (failed) return;
       if (bar) {
@@ -30,9 +33,15 @@
         ? bytes(seen) + ' / ' + bytes(total)
         : (seen ? bytes(seen) + ' downloaded' : 'Loading game…');
     }
+    /** Catch script execution failures until the runtime takes over error reporting. */
+    function startupError(event) {
+      fail(event.error || new Error(event.message || 'Game startup failed'));
+    }
+    /** Display a terminal startup error, releasing temporary browser listeners. */
     function fail(error) {
       if (failed) return;
       failed = true;
+      global.removeEventListener('error', startupError);
       cancelAnimationFrame(frame);
       if (overlay) {
         overlay.hidden = false;
@@ -47,6 +56,7 @@
       console.error('LaBelle game loading failed:', error);
       options.onError?.(error);
     }
+    /** Match the backing buffer to an independently sized CSS canvas. */
     function fit() {
       if (!canvas || failed) return;
       const dpr = global.devicePixelRatio || 1;
@@ -57,6 +67,7 @@
       // A backend may reset the buffer during init without changing its CSS box.
       frame = requestAnimationFrame(fit);
     }
+    /** Forward one download stream while counting its decompressed bytes. */
     function count(body) {
       const reader = body.getReader();
       return new ReadableStream({
@@ -72,6 +83,7 @@
         cancel(reason) { return reader.cancel(reason); }
       });
     }
+    global.addEventListener('error', startupError);
     module.canvas = canvas;
     module.instantiateWasm = function (imports, receiveInstance) {
       // locateFile retains project CDN/cache-busting choices. Override wasmURL
@@ -101,6 +113,7 @@
     module.onRuntimeInitialized = function () {
       try {
         previousReady?.apply(this, arguments);
+        global.removeEventListener('error', startupError);
         if (!failed && overlay) {
           overlay.hidden = true;
           overlay.setAttribute('aria-busy', 'false');
@@ -111,7 +124,10 @@
       fail(reason);
       previousAbort?.apply(this, arguments);
     };
-    module.labelleLoader = { fail, dispose() { cancelAnimationFrame(frame); } };
+    module.labelleLoader = { fail, dispose() {
+      cancelAnimationFrame(frame);
+      global.removeEventListener('error', startupError);
+    } };
     if (canvas) canvas.addEventListener('contextmenu', event => event.preventDefault());
     progress();
     // Custom canvases may size themselves from their backing attributes.

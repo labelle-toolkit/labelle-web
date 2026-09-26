@@ -33,7 +33,9 @@ so the total is the raw file size even with gzip/Brotli hosting. Compilation
 streams from the same counted response; browsers without `instantiateStreaming`
 use a buffered fallback. Without a known size the bar is indeterminate. The
 loader hides on `Module.onRuntimeInitialized` and reports JS/download/compile/
-abort failures visibly. The canvas follows its CSS size and devicePixelRatio,
+abort failures visibly. Temporary window error handling also catches game-script
+syntax errors and synchronous startup exceptions, and is removed once the runtime
+initializes (later game errors do not reopen the loading screen). The canvas follows its CSS size and devicePixelRatio,
 including backend buffer resets during startup. Reduced-motion preferences stop
 the logo pulse.
 
