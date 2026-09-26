@@ -147,7 +147,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 5c9f49c218b61e0a245d3fd9da25b0c3aad6a320
+          ref: f229251496b46795b17cb5d943c999fa640a0ea4
           path: .test-cli
           persist-credentials: false
       - run: zig build
