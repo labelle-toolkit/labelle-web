@@ -100,12 +100,16 @@ test('request success followed by transaction abort is never reported saved', as
     const api = create({ open() {
         queueMicrotask(() => request.onsuccess());
         request.result = { close() {}, transaction() {
-            transaction = { objectStore() { return { put() { return {}; } }; } };
+            transaction = { objectStore() { return { put() { return putRequest; } }; } };
             return transaction;
         } };
         return request;
     } });
+    const putRequest = { result: 'a.json' };
     const id = api.begin('test-game', 1, 'a.json', bytes('data'), 0);
+    await new Promise(resolve => setImmediate(resolve));
+    // The put request itself succeeds; only the transaction outcome may count.
+    putRequest.onsuccess?.({ target: putRequest });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(api.status(id), 0);
     transaction.error = new DOMException('quota', 'QuotaExceededError');
@@ -117,11 +121,14 @@ test('request success followed by transaction abort is never reported saved', as
 
 test('concurrent writes preserve submission order, namespaces isolate and release does not cancel', async () => {
     const api = create(new IDBFactory());
+    const released = api.begin('test-game', 1, 'released.json', bytes('released'), 0);
     const first = api.begin('test-game', 1, 'a.json', bytes('first'), 0);
     const last = api.begin('test-game', 1, 'a.json', bytes('last'), 0);
+    api.release(released);
     api.release(first);
     assert.equal(await settle(api, last), 1);
     api.release(last);
+    assert.equal(text(await run(api, 0, 'released.json')), 'released');
     assert.equal(text(await run(api, 0, 'a.json')), 'last');
     const other = api.begin('other-game', 0, 'a.json', new Uint8Array(), 100);
     assert.equal(await settle(api, other), -1);
@@ -198,5 +205,20 @@ test('legacy Blob records still load; new records store copied typed bytes', asy
     db.close();
     assert.equal(text(await run(api, 0, 'old.json')), 'legacy');
     assert.equal(JSON.parse(text(await run(api, 2))).find(e => e.name === 'old.json').size, 6);
+    await api.close();
+});
+
+test('unknown, released and failed-begin handles read as empty instead of throwing', async () => {
+    const api = create(new IDBFactory());
+    for (const id of [0, 7, 0xffffffff]) {
+        assert.equal(api.status(id), -3);
+        assert.equal(api.data(id).length, 0);
+        api.release(id);
+    }
+    const id = api.begin('test-game', 1, 'a.json', bytes('data'), 0);
+    assert.equal(await settle(api, id), 1);
+    api.release(id);
+    assert.equal(api.status(id), -3);
+    assert.equal(api.data(id).length, 0);
     await api.close();
 });

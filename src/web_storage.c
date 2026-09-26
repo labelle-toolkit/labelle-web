@@ -105,7 +105,9 @@ EM_JS(void, labelle_blob_init_js, (), {
         return {
             begin: begin,
             status: id => operations.has(id) ? operations.get(id).status : -3,
-            data: id => operations.get(id).bytes,
+            // Unknown, released or failed-begin (0) handles read as empty so
+            // length/copy never throw across the EM_JS boundary.
+            data: id => operations.has(id) ? operations.get(id).bytes : new Uint8Array(),
             release: id => operations.delete(id),
             close: async () => {
                 for (const promise of databases.values()) { try { (await promise).close(); } catch (_) {} }
@@ -127,20 +129,35 @@ EM_JS(uint32_t, labelle_blob_begin_js, (const char *ns, uint32_t ns_len, uint32_
             UTF8ToString(name, name_len), HEAPU8.subarray(data, data + data_len), limit);
     } catch (_) { return 0; }
 });
+// Every entry point below must return a typed result instead of throwing: a JS
+// exception crossing EM_JS aborts the wasm caller. The service only exists after
+// the first begin, and a handle may be unknown, released or the failed-begin 0.
 EM_JS(int32_t, labelle_blob_status_js, (uint32_t id), {
-    return globalThis.__labelleBlobs.status(id);
+    try {
+        const s = globalThis.__labelleBlobs;
+        return s ? s.status(id) : -3;
+    } catch (_) { return -3; }
 });
 EM_JS(uint32_t, labelle_blob_length_js, (uint32_t id), {
-    return globalThis.__labelleBlobs.data(id).length;
+    try {
+        const s = globalThis.__labelleBlobs;
+        return s ? s.data(id).length : 0;
+    } catch (_) { return 0; }
 });
 EM_JS(int32_t, labelle_blob_copy_js, (uint32_t id, uint8_t *out, uint32_t len), {
-    const data = globalThis.__labelleBlobs.data(id);
-    if (data.length !== len) return 0;
-    HEAPU8.set(data, out);
-    return 1;
+    try {
+        const s = globalThis.__labelleBlobs;
+        const data = s ? s.data(id) : new Uint8Array();
+        if (data.length !== len) return 0;
+        HEAPU8.set(data, out);
+        return 1;
+    } catch (_) { return 0; }
 });
 EM_JS(void, labelle_blob_release_js, (uint32_t id), {
-    globalThis.__labelleBlobs.release(id);
+    try {
+        const s = globalThis.__labelleBlobs;
+        if (s) s.release(id);
+    } catch (_) {}
 });
 
 uint32_t labelle_blob_begin(const char *ns, uint32_t ns_len, uint32_t kind, const char *name, uint32_t name_len, const uint8_t *data, uint32_t data_len, uint32_t limit) {
