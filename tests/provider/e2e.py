@@ -84,13 +84,24 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         (web / 'linked-extra.js').symlink_to(project / 'real-game.js')
         run('web', 'export', '--output=dist', fail='UnsupportedBuildArtifact')
         assert (dist / 'index.html').read_bytes() == original_export
+        run('web', 'serve', '--no-open', fail='UnsupportedBuildArtifact')
         (web / 'linked-extra.js').unlink()
+    # Runtime names must deploy to case-sensitive hosts without changing spelling.
+    (web / 'game.js').rename(web / 'GAME.JS')
+    run('web', 'export', '--output=dist', fail='InvalidBuildArtifact')
+    (web / 'GAME.JS').rename(web / 'game.js')
+    (web / '.labelle-export').write_text('input must not replace ownership')
+    run('web', 'export', '--output=dist', fail='ReservedWebAsset')
+    (web / '.labelle-export').unlink()
     # Custom source stays untouched; relative page resources ship with it.
     custom = project / 'web'
     custom.mkdir()
     source = '<!doctype html><title>Custom</title><div data-wasm-bytes="__WASM_BYTES__"></div><script src="extra.js"></script>'
     (custom / 'index.html').write_text(source)
     (custom / 'extra.js').write_text('window.extra = true;')
+    (custom / '.labelle-export').write_text('not metadata')
+    run('web', 'export', '--output=reserved-marker', fail='ReservedWebAsset')
+    (custom / '.labelle-export').unlink()
     run('web', 'export', '--output=dist')
     assert (dist / 'index.html').read_text() == source.replace('__WASM_BYTES__', '8')
     assert (custom / 'index.html').read_text() == source
@@ -190,6 +201,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         optimizer.chmod(0o755)
         env['PATH'] = str(tools) + os.pathsep + os.environ['PATH']
         (web / 'game.wasm').write_bytes(wasm + b'\0\1\0')
+        (web / 'game.wasm.opt').write_bytes(b'legitimate asset')
         (web / 'game.wasm.gz').write_bytes(b'stale')
         (web / 'index.html.gz').write_bytes(b'stale')
         run('web', 'export', '--output=optimized')
@@ -198,6 +210,11 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         assert 'data-wasm-bytes="8"' in (final / 'index.html').read_text()
         assert not (final / 'game.wasm.gz').exists()
         assert not (final / 'index.html.gz').exists()
+        assert (final / 'game.wasm.opt').read_bytes() == b'legitimate asset'
+        optimizer.write_text(optimizer.read_text() + '\nraise SystemExit(1)\n')
+        run('web', 'export', '--output=optimizer-failed')
+        assert (project / 'optimizer-failed/game.wasm.opt').read_bytes() == b'legitimate asset'
+        assert not list(project.glob('*.wasm-opt-*')), 'optimizer scratch directories leaked'
         (web / 'game.wasm').write_bytes(wasm)
         env['PATH'] = os.environ['PATH']
     # Serve through the actual CLI, including final stamped page and custom JS.
@@ -219,6 +236,16 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
                     raise AssertionError(log.read())
                 time.sleep(.1)
         assert response == source.replace('__WASM_BYTES__', '8')
+        if os.name != 'nt':
+            # A new symlink introduced after startup cannot escape the served root.
+            (web / 'escape.txt').symlink_to(project / 'project.labelle')
+            try:
+                urllib.request.urlopen(f'http://127.0.0.1:{port}/escape.txt', timeout=3)
+                raise AssertionError('server followed an escaping symlink')
+            except urllib.error.HTTPError as error:
+                assert error.code == 403, error.code
+            finally:
+                (web / 'escape.txt').unlink()
         assert urllib.request.urlopen(f'http://127.0.0.1:{port}/' + urllib.parse.quote('café image.txt'), timeout=3).read() == b'unicode resource'
         for hidden in ('.labelle-shell-state.json', './.labelle-shell-state.json', '.LABELLE-SHELL-STATE.JSON', '%2elabelle-shell-state.json', '%2e%2e/project.labelle', '%5c..%5cproject.labelle'):
             try:

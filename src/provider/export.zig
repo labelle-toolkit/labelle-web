@@ -170,15 +170,21 @@ pub fn packageExport(
 const Ownership = struct { format: []const u8 = "labelle-web-export-v1", zip_sha256: ?[64]u8 = null };
 
 /// Refuse unsupported entries before clearing any existing destination.
-fn validateBuildTree(io: std.Io, parent: std.Io.Dir, path: []const u8) !void {
+pub fn validateBuildTree(io: std.Io, parent: std.Io.Dir, path: []const u8) !void {
+    return validateTree(io, parent, path, true);
+}
+fn validateTree(io: std.Io, parent: std.Io.Dir, path: []const u8, root: bool) !void {
     const dir = try parent.openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next(io)) |entry| switch (entry.kind) {
-        .directory => try validateBuildTree(io, dir, entry.name),
-        .file => {},
-        else => return error.UnsupportedBuildArtifact,
-    };
+    while (try it.next(io)) |entry| {
+        if (root and std.ascii.eqlIgnoreCase(entry.name, export_marker)) return error.ReservedWebAsset;
+        switch (entry.kind) {
+            .directory => try validateTree(io, dir, entry.name, false),
+            .file => {},
+            else => return error.UnsupportedBuildArtifact,
+        }
+    }
 }
 
 fn recognizedMarker(data: []const u8) bool {
@@ -355,13 +361,16 @@ fn optimizeWasm(
     files: *std.ArrayList(FileReport),
 ) !bool {
     const cwd = std.Io.Dir.cwd();
+    const scratch = try optimizerScratch(allocator, io, output_dir);
+    defer allocator.free(scratch);
+    defer cwd.deleteTree(io, scratch) catch {};
     var any = false;
     for (files.items) |*f| {
         if (!std.mem.endsWith(u8, f.rel, ".wasm")) continue;
 
         const in_path = try std.fs.path.join(allocator, &.{ output_dir, f.rel });
         defer allocator.free(in_path);
-        const out_path = try std.fmt.allocPrint(allocator, "{s}.opt", .{in_path});
+        const out_path = try std.fs.path.join(allocator, &.{ scratch, "optimized.wasm" });
         defer allocator.free(out_path);
 
         const result = std.process.run(allocator, io, .{
@@ -400,6 +409,21 @@ fn optimizeWasm(
         any = true;
     }
     return any;
+}
+
+/// An exclusively created sibling directory stays outside the shipped tree.
+fn optimizerScratch(a: std.mem.Allocator, io: std.Io, output: []const u8) ![]const u8 {
+    while (true) {
+        var random: [16]u8 = undefined;
+        io.random(&random);
+        const name = try std.fmt.allocPrint(a, "{s}.wasm-opt-{s}", .{ trimTrailingSeps(output), std.fmt.bytesToHex(random, .lower) });
+        std.Io.Dir.cwd().createDir(io, name, .default_dir) catch |err| {
+            a.free(name);
+            if (err == error.PathAlreadyExists) continue;
+            return err;
+        };
+        return name;
+    }
 }
 
 /// Update an existing report row's `after` size, or append a new one.

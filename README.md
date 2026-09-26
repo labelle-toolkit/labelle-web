@@ -140,12 +140,13 @@ labelle web export --output=dist --zip --platform=github-pages
 Provider commands consume existing build output. They discover exactly one
 `.labelle/*_wasm/zig-out/web` directory containing `game.wasm`; use
 `--input=/absolute/path/to/web` when multiple backends have been built.
-`game.js` and `game.wasm` are required. Arguments use `--name=value` syntax;
+`game.js` and `game.wasm` are required with exactly that casing. Symlinked
+build artifacts are rejected before staging, serving, or export. Arguments use `--name=value` syntax;
 export platform is optional (`itch` or `github-pages`). GitHub Pages export
 adds `.nojekyll`. ZIP archives contain the final staged files.
 
 Project `web/` resources are copied alongside the selected page. Root filenames
-`game.js`, `game.wasm`, `game.data`, `labelle-loader.js`, `labelle-logo.png` and
+`game.js`, `game.wasm`, `game.data`, `.labelle-export`, `labelle-loader.js`, `labelle-logo.png` and
 `.labelle-shell-state.json` are reserved (including case variants and compressed siblings); custom assets
 cannot replace them.
 Precompressed custom files are ignored when the original file is present;

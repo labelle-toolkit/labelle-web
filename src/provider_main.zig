@@ -65,11 +65,19 @@ fn execute(init: std.process.Init) !void {
     else
         try discover(a, io, project);
     const web = try cwd.realPathFileAlloc(io, input, a);
-    // A stale empty/generated directory is never a successful build.
-    for ([_][]const u8{ "game.js", "game.wasm" }) |name| {
-        const file = try std.fs.path.join(a, &.{ web, name });
-        if ((try cwd.statFile(io, file, .{ .follow_symlinks = false })).kind != .file) return error.InvalidBuildArtifact;
+    // Check directory entries, not case-insensitive lookups: deployed HTML
+    // requests these exact spellings even when the build host is Windows/macOS.
+    const built = try cwd.openDir(io, web, .{ .iterate = true });
+    defer built.close(io);
+    var entries = built.iterate();
+    var js_found = false;
+    var wasm_found = false;
+    while (try entries.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "game.js")) js_found = entry.kind == .file;
+        if (std.mem.eql(u8, entry.name, "game.wasm")) wasm_found = entry.kind == .file;
     }
+    if (!js_found or !wasm_found) return error.InvalidBuildArtifact;
+    try exporter.validateBuildTree(io, cwd, web);
     const project_web = try std.fs.path.join(a, &.{ project, "web" });
     if (std.mem.eql(u8, action, "export")) {
         if (opts.port != null or opts.no_open) return error.ServeOptionOnExport;

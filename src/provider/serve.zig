@@ -363,6 +363,41 @@ fn handleConnection(
         try std.fs.path.join(allocator, &.{ web_dir, rel.? });
     defer allocator.free(file_path);
 
+    // Recheck containment on every request: files may change after startup.
+    // This also protects callers which use this server without provider preflight.
+    const actual = std.Io.Dir.cwd().realPathFileAlloc(io, file_path, allocator) catch |err| switch (err) {
+        error.FileNotFound => {
+            try request.respond("404 Not Found\n", .{ .status = .not_found });
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(actual);
+    if (std.ascii.eqlIgnoreCase(std.fs.path.basename(actual), @import("assets.zig").state_file)) {
+        try request.respond("403 Forbidden\n", .{ .status = .forbidden });
+        return;
+    }
+    var contained = false;
+    for ([_]?[]const u8{ web_dir, project_web_dir }) |candidate| {
+        const source = candidate orelse continue;
+        const root = std.Io.Dir.cwd().realPathFileAlloc(io, source, allocator) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(root);
+        const prefix = if (builtin.os.tag == .windows) std.ascii.startsWithIgnoreCase(actual, root) else std.mem.startsWith(u8, actual, root);
+        if (prefix and (actual.len == root.len or (actual.len > root.len and (std.fs.path.isSep(root[root.len - 1]) or std.fs.path.isSep(actual[root.len]))))) contained = true;
+    }
+    if (!contained) {
+        try request.respond("403 Forbidden\n", .{ .status = .forbidden });
+        return;
+    }
+
+    if ((try std.Io.Dir.cwd().statFile(io, actual, .{})).kind != .file) {
+        try request.respond("404 Not Found\n", .{ .status = .not_found });
+        return;
+    }
+
     // For the root request the served file may be `game.html`; report
     // an HTML content-type regardless of the candidate that matched.
     const content_type = if (isRootRequest(rel.?)) "text/html; charset=utf-8" else mimeFor(rel.?);
@@ -370,7 +405,7 @@ fn handleConnection(
     // Cap the read so a stray huge file in `web_dir` can't OOM the
     // server. 1 GiB is generous for a WASM bundle + assets.
     const max_file_bytes = 1024 * 1024 * 1024;
-    const body = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| switch (err) {
+    const body = std.Io.Dir.cwd().readFileAlloc(io, actual, allocator, .limited(max_file_bytes)) catch |err| switch (err) {
         error.FileNotFound => {
             try request.respond("404 Not Found\n", .{ .status = .not_found });
             return;

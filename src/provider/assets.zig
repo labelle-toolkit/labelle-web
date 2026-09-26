@@ -98,7 +98,7 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
     var it = src.iterate();
     while (try it.next(io)) |entry| {
         if (root and std.mem.eql(u8, entry.name, "index.html")) continue;
-        if (root) for ([_][]const u8{ "game.js", "game.wasm", "game.data", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |reserved| {
+        if (root) for ([_][]const u8{ "game.js", "game.wasm", "game.data", ".labelle-export", "index.html", "labelle-loader.js", "labelle-logo.png", state_file }) |reserved| {
             const name = compressedBase(entry.name) orelse entry.name;
             if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedWebAsset;
         };
