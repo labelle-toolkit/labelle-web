@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  zig:
+    name: zig fmt + build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: zig fmt --check
+        run: zig fmt --check .
+      - name: zig build
+        run: zig build --summary all
+      # Compiles the Zig bindings for wasm32-emscripten (no emsdk needed).
+      - name: zig build test
+        run: zig build test --summary all
+
+  # The EM_JS storage factory, extracted verbatim from src/web_storage.c and
+  # driven against fake-indexeddb.
+  storage-node:
+    name: IndexedDB storage (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tests/web-storage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci --ignore-scripts
+      - run: npm test
+
+  # Compiles web_storage.c with emcc and runs the real EM_JS entry points from
+  # wasm under Node. A JS exception crossing EM_JS aborts the module, so any
+  # entry point that throws fails this job. emsdk is pinned to the release
+  # labelle-bgfx's wasm build resolves (build.zig.zon `.emsdk`, ref 4.0.9).
+  emscripten:
+    name: emcc compile + wasm boundary run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EMSDK_VERSION: 4.0.9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Cache emsdk
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ runner.os }}-${{ env.EMSDK_VERSION }}
+      - name: Install emsdk
+        run: |
+          set -euo pipefail
+          if [ ! -x ~/emsdk/emsdk ]; then
+            git clone --depth 1 --branch "$EMSDK_VERSION" https://github.com/emscripten-core/emsdk ~/emsdk
+          fi
+          ~/emsdk/emsdk install "$EMSDK_VERSION"
+          ~/emsdk/emsdk activate "$EMSDK_VERSION"
+      - name: Build and run the wasm boundary test
+        run: |
+          set -euo pipefail
+          source ~/emsdk/emsdk_env.sh
+          emcc --version | head -1
+          mkdir -p zig-out/wasm-boundary
+          emcc -O1 -Wall -Werror -sENVIRONMENT=node \
+            tests/wasm-boundary/boundary.c src/web_storage.c \
+            -o zig-out/wasm-boundary/boundary.js
+          node zig-out/wasm-boundary/boundary.js
