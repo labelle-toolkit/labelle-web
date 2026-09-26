@@ -216,6 +216,32 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     (custom / '__labelle_livereload').write_text('ordinary project asset')
     if os.name != 'nt':
         (custom / 'encoded\\asset.txt').write_text('POSIX asset')
+    # Directory ownership also covers empty directories and Unicode shape changes.
+    (custom / 'empty-owned').mkdir()
+    (custom / 'ÖShape').write_text('Unicode file')
+    hook()
+    (custom / 'empty-owned').rmdir()
+    (custom / 'empty-owned').write_text('replaced empty directory')
+    (custom / 'ÖShape').unlink()
+    (custom / 'öShape').mkdir()
+    (custom / 'öShape/child.txt').write_text('child')
+    hook()
+    assert (web / 'empty-owned').read_text() == 'replaced empty directory'
+    assert (web / 'öShape/child.txt').read_text() == 'child'
+    (custom / 'öShape/child.txt').unlink()
+    (custom / 'öShape').rmdir()
+    (custom / 'ÖShape').write_text('file again')
+    hook()
+    assert (web / 'ÖShape').read_text() == 'file again'
+    (web / 'backend-empty').mkdir()
+    (custom / 'backend-empty').write_text('must not replace backend directory')
+    hook(fail='InvalidWebAssetDestination')
+    assert (web / 'backend-empty').is_dir()
+    (custom / 'backend-empty').unlink()
+    # Invalid semantic settings fail before restamping the existing output.
+    page_before = (web / 'index.html').read_bytes()
+    run('web', 'serve', '--port=0', fail='InvalidPort')
+    assert (web / 'index.html').read_bytes() == page_before
     # Preflight is all-or-nothing for unsupported trees: no untracked partial overlay.
     (custom / 'ordinary-partial.txt').write_text('must not leak')
     (custom / 'GAME.JS').write_text('invalid reserved entry')

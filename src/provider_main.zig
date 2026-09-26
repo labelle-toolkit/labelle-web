@@ -50,6 +50,7 @@ fn execute(init: std.process.Init) !void {
         if (ctx.invocation.kind != .command) return error.UnexpectedHookArguments;
         if (std.mem.startsWith(u8, arg, "--input=")) opts.input = arg[8..] else if (std.mem.startsWith(u8, arg, "--output=")) opts.output = arg[9..] else if (std.mem.startsWith(u8, arg, "--port=")) opts.port = try std.fmt.parseInt(u16, arg[7..], 10) else if (std.mem.eql(u8, arg, "--no-open")) opts.no_open = true else if (std.mem.eql(u8, arg, "--zip")) opts.zip = true else if (std.mem.startsWith(u8, arg, "--platform=")) opts.platform = exporter.parsePlatform(arg[11..]) orelse return error.InvalidExportPlatform else return error.UnknownArgument;
     }
+    if ((opts.port orelse settings.port) == 0) return error.InvalidPort;
     const action = ctx.invocation.id;
     if (ctx.invocation.kind == .hook) {
         if (!std.mem.eql(u8, ctx.target.?, "wasm")) return error.UnsupportedTarget;

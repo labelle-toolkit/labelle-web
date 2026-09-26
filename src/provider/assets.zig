@@ -1,7 +1,23 @@
 const std = @import("std");
 pub const state_file = ".labelle-shell-state.json";
 const Custom = struct { path: []const u8, digest: [64]u8 };
-const State = struct { original: ?[]const u8, rendered: [64]u8, custom: []const Custom = &.{} };
+const State = struct { schema: u8 = 1, original: ?[]const u8, rendered: [64]u8, custom: []const Custom = &.{}, directories: []const []const u8 = &.{} };
+const Owned = struct {
+    files: std.StringHashMap([64]u8),
+    directories: std.StringHashMap(void),
+    file_ids: std.AutoHashMap(std.Io.File.INode, void),
+    directory_ids: std.AutoHashMap(std.Io.File.INode, void),
+    legacy_directories: bool = false,
+    fn init(a: std.mem.Allocator) Owned {
+        return .{ .files = .init(a), .directories = .init(a), .file_ids = .init(a), .directory_ids = .init(a) };
+    }
+    fn deinit(self: *Owned) void {
+        self.files.deinit();
+        self.directories.deinit();
+        self.file_ids.deinit();
+        self.directory_ids.deinit();
+    }
+};
 const shell = @import("../shell.zig");
 
 /// Copy custom page resources and stamp the shell from its original source.
@@ -31,6 +47,11 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         else => return err,
     } else null;
     defer if (project) |dir| dir.close(io);
+    var directories: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (directories.items) |path| a.free(path);
+        directories.deinit(a);
+    }
     var copied: std.ArrayList(Custom) = .empty;
     defer {
         for (copied.items) |entry| a.free(entry.path);
@@ -41,12 +62,21 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
     // case-only renames without guessing filesystem case-folding rules.
     if (previous) |state| {
         for (state.value.custom) |old| try removeStale(a, io, out, old.path, old.digest);
-        for (state.value.custom) |old| {
-            var parent = std.fs.path.dirname(old.path);
-            while (parent) |path| {
-                if (path.len == 0) break;
-                out.deleteDir(io, path) catch break; // preserve nonempty/backend parents
-                parent = std.fs.path.dirname(path);
+        if (state.value.schema < 2) {
+            // Migrate pre-release provenance which did not record directories.
+            for (state.value.custom) |old| {
+                var parent = std.fs.path.dirname(old.path);
+                while (parent) |path| {
+                    if (path.len == 0) break;
+                    try removeEmptyOwnedDir(io, out, path);
+                    parent = std.fs.path.dirname(path);
+                }
+            }
+        } else {
+            var n = state.value.directories.len;
+            while (n > 0) {
+                n -= 1;
+                try removeEmptyOwnedDir(io, out, state.value.directories[n]);
             }
         }
     }
@@ -56,12 +86,12 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
         const out_real = try out.realPathFileAlloc(io, ".", a);
         defer a.free(out_real);
         if (within(out_real, src_real) or within(src_real, out_real)) return error.OverlappingShellDirectories;
-        try copy(a, io, dir, out, "", &copied);
+        try copy(a, io, dir, out, "", &copied, &directories);
     }
     _ = try shell.stage(a, io, out, project);
     const rendered = (try optional(a, io, out, "index.html")).?;
     defer a.free(rendered);
-    const saved = try std.json.Stringify.valueAlloc(a, State{ .original = original, .rendered = hash(rendered), .custom = copied.items }, .{});
+    const saved = try std.json.Stringify.valueAlloc(a, State{ .schema = 2, .original = original, .rendered = hash(rendered), .custom = copied.items, .directories = directories.items }, .{});
     defer a.free(saved);
     try out.writeFile(io, .{ .sub_path = state_file, .data = saved });
     // Stamping/loader updates invalidate precompressed copies.
@@ -85,12 +115,22 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
     if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
     var previous: ?std.json.Parsed(State) = null;
     defer if (previous) |value| value.deinit();
-    var owned = std.StringHashMap([64]u8).init(a);
+    var owned = Owned.init(a);
     defer owned.deinit();
     if (try optional(a, io, dst, state_file)) |saved| {
         defer a.free(saved);
         previous = try std.json.parseFromSlice(State, a, saved, .{ .allocate = .alloc_always });
-        for (previous.?.value.custom) |entry| try owned.put(entry.path, entry.digest);
+        owned.legacy_directories = previous.?.value.schema < 2;
+        for (previous.?.value.custom) |entry| {
+            try owned.files.put(entry.path, entry.digest);
+            const st = dst.statFile(io, entry.path, .{ .follow_symlinks = false }) catch continue;
+            if (st.kind == .file and st.nlink == 1 and std.mem.eql(u8, &entry.digest, &try hashFile(io, dst, entry.path))) try owned.file_ids.put(st.inode, {});
+        }
+        for (previous.?.value.directories) |path_name| {
+            try owned.directories.put(path_name, {});
+            const st = dst.statFile(io, path_name, .{ .follow_symlinks = false }) catch continue;
+            if (st.kind == .directory) try owned.directory_ids.put(st.inode, {});
+        }
     }
     try validateCustom(a, io, src, dst, "", &owned);
 }
@@ -101,7 +141,7 @@ fn reserved(name: []const u8) bool {
     }
     return false;
 }
-fn validateCustom(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, prefix: []const u8, owned: *const std.StringHashMap([64]u8)) !void {
+fn validateCustom(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: ?std.Io.Dir, prefix: []const u8, owned: *const Owned) !void {
     const root = prefix.len == 0;
     var it = src.iterate();
     while (try it.next(io)) |entry| {
@@ -151,17 +191,20 @@ fn validateCustom(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: ?std.I
     }
 }
 
-fn ownedFile(io: std.Io, dir: std.Io.Dir, name: []const u8, path: []const u8, owned: *const std.StringHashMap([64]u8)) !bool {
-    const digest = owned.get(path) orelse return false;
-    return std.mem.eql(u8, &digest, &try hashFile(io, dir, name));
+fn ownedFile(io: std.Io, dir: std.Io.Dir, name: []const u8, path: []const u8, owned: *const Owned) !bool {
+    if (owned.files.get(path)) |digest| return std.mem.eql(u8, &digest, &try hashFile(io, dir, name));
+    const st = try dir.statFile(io, name, .{ .follow_symlinks = false });
+    return st.kind == .file and st.nlink == 1 and owned.file_ids.contains(st.inode);
 }
-fn ownedTreeOnly(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, owned: *const std.StringHashMap([64]u8)) !bool {
-    var has_owned = false;
-    var keys = owned.keyIterator();
-    while (keys.next()) |key| {
-        if (within(key.*, prefix) and key.len > prefix.len) {
-            has_owned = true;
-            break;
+fn ownedTreeOnly(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, owned: *const Owned) !bool {
+    var has_owned = owned.directories.contains(prefix) or owned.directory_ids.contains((try dir.statFile(io, ".", .{})).inode);
+    if (!has_owned and owned.legacy_directories) {
+        var keys = owned.files.keyIterator();
+        while (keys.next()) |key| {
+            if (within(key.*, prefix) and key.len > prefix.len) {
+                has_owned = true;
+                break;
+            }
         }
     }
     if (!has_owned) return false;
@@ -202,7 +245,7 @@ fn within(child: []const u8, parent: []const u8) bool {
     return prefix and (child.len == parent.len or (child.len > parent.len and (std.fs.path.isSep(parent[parent.len - 1]) or std.fs.path.isSep(child[parent.len]))));
 }
 
-fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, prefix: []const u8, copied: *std.ArrayList(Custom)) !void {
+fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, prefix: []const u8, copied: *std.ArrayList(Custom), directories: *std.ArrayList([]const u8)) !void {
     const root = prefix.len == 0;
     var it = src.iterate();
     while (try it.next(io)) |entry| {
@@ -228,10 +271,13 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
                 try copied.append(a, .{ .path = path, .digest = try hashFile(io, dst, entry.name) });
             },
             .directory => {
+                var created = false;
                 if (dst.statFile(io, entry.name, .{ .follow_symlinks = false })) |st| {
                     if (st.kind != .directory) return error.InvalidWebAssetDestination;
                 } else |err| switch (err) {
-                    error.FileNotFound => {},
+                    error.FileNotFound => {
+                        created = true;
+                    },
                     else => return err,
                 }
                 try dst.createDirPath(io, entry.name);
@@ -241,7 +287,12 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
                 defer to.close(io);
                 const child = try std.fs.path.join(a, &.{ prefix, entry.name });
                 defer a.free(child);
-                try copy(a, io, from, to, child, copied);
+                if (created) {
+                    const owned_path = try a.dupe(u8, child);
+                    errdefer a.free(owned_path);
+                    try directories.append(a, owned_path);
+                }
+                try copy(a, io, from, to, child, copied, directories);
             },
             else => return error.UnsupportedWebAsset,
         }
@@ -273,6 +324,28 @@ fn removeStale(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const 
     try dir.deleteFile(io, head);
     try invalidateCompressed(a, io, dir, head);
 }
+/// Remove only an empty recorded directory, never following a stale alias.
+fn removeEmptyOwnedDir(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or (@import("builtin").os.tag == .windows and std.mem.indexOfScalar(u8, path, ':') != null)) return error.InvalidAssetProvenance;
+    const sep = std.mem.indexOfAny(u8, path, if (@import("builtin").os.tag == .windows) "/\\" else "/");
+    const head = path[0 .. sep orelse path.len];
+    if (head.len == 0 or std.mem.eql(u8, head, ".") or std.mem.eql(u8, head, "..")) return error.InvalidAssetProvenance;
+    const st = dir.statFile(io, head, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (st.kind != .directory) return;
+    if (sep) |at| {
+        const child = try dir.openDir(io, head, .{ .follow_symlinks = false });
+        defer child.close(io);
+        return removeEmptyOwnedDir(io, child, path[at + 1 ..]);
+    }
+    dir.deleteDir(io, head) catch |err| switch (err) {
+        error.FileNotFound, error.DirNotEmpty => {},
+        else => return err,
+    };
+}
+
 fn hashFile(io: std.Io, dir: std.Io.Dir, path: []const u8) ![64]u8 {
     const file = try dir.openFile(io, path, .{});
     defer file.close(io);
