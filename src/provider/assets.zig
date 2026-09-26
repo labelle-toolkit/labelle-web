@@ -100,19 +100,8 @@ pub fn stage(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_
 
 /// Validate the complete custom overlay before any file or provenance changes.
 pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, project_path: ?[]const u8) !void {
-    const path = project_path orelse return;
-    const src = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer src.close(io);
     const dst = try std.Io.Dir.cwd().openDir(io, output_path, .{});
     defer dst.close(io);
-    const source = try src.realPathFileAlloc(io, ".", a);
-    defer a.free(source);
-    const output = try dst.realPathFileAlloc(io, ".", a);
-    defer a.free(output);
-    if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
     var previous: ?std.json.Parsed(State) = null;
     defer if (previous) |value| value.deinit();
     var owned = Owned.init(a);
@@ -132,6 +121,17 @@ pub fn preflight(a: std.mem.Allocator, io: std.Io, output_path: []const u8, proj
             if (st.kind == .directory) try owned.directory_ids.put(st.inode, {});
         }
     }
+    const path = project_path orelse return;
+    const src = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer src.close(io);
+    const source = try src.realPathFileAlloc(io, ".", a);
+    defer a.free(source);
+    const output = try dst.realPathFileAlloc(io, ".", a);
+    defer a.free(output);
+    if (within(output, source) or within(source, output)) return error.OverlappingShellDirectories;
     try validateCustom(a, io, src, dst, "", &owned);
 }
 fn reserved(name: []const u8) bool {
@@ -289,8 +289,10 @@ fn copy(a: std.mem.Allocator, io: std.Io, src: std.Io.Dir, dst: std.Io.Dir, pref
                 defer a.free(child);
                 if (created) {
                     const owned_path = try a.dupe(u8, child);
-                    errdefer a.free(owned_path);
-                    try directories.append(a, owned_path);
+                    directories.append(a, owned_path) catch |err| {
+                        a.free(owned_path);
+                        return err;
+                    };
                 }
                 try copy(a, io, from, to, child, copied, directories);
             },

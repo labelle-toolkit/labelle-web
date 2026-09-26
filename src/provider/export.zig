@@ -486,7 +486,7 @@ fn writeZipArchive(allocator: std.mem.Allocator, io: std.Io, output_dir: []const
     for (entries.items) |rel| {
         const full = try std.fs.path.join(allocator, &.{ output_dir, rel });
         defer allocator.free(full);
-        const data = try cwd.readFileAlloc(io, full, allocator, .limited(1024 * 1024 * 1024));
+        const data = try cwd.readFileAlloc(io, full, allocator, .limited(std.math.maxInt(u32)));
         defer allocator.free(data);
 
         // ZIP entry names always use '/'.

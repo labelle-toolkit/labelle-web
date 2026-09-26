@@ -287,6 +287,16 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     hook()
     assert 'data-wasm-bytes="8"' in (project / 'bundle/index.html').read_text()
     assert not (project / 'bundle/.labelle-shell-state.json').exists()
+    # Corrupt provenance must preserve an existing release even without web/.
+    state_path = web / '.labelle-shell-state.json'
+    saved_state = state_path.read_bytes()
+    previous_release = (project / 'bundle/index.html').read_bytes()
+    custom.rename(project / 'web-away')
+    state_path.write_text('{')
+    hook(fail='UnexpectedEndOfInput')
+    assert (project / 'bundle/index.html').read_bytes() == previous_release
+    state_path.write_bytes(saved_state)
+    (project / 'web-away').rename(custom)
     # JSON escaping may make provenance larger than the supported source HTML.
     context.update(invocation=dict(kind='hook', id='shell', step='build', phase='after'), output_dir=str(web.parent))
     large_page = '"' * (9 * 1024 * 1024)
