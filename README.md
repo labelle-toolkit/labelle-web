@@ -4,12 +4,12 @@ Web platform package for the Labelle toolkit.
 
 ## Status
 
-IndexedDB blob storage is implemented in `src/web_storage.c` with Zig bindings in `src/web_storage.zig`. The backend adds the C source with its emscripten sysroot and imports the `storage` module. Runtime service selection remains explicit. The default loading shell and its staging API/tool are implemented; automatic CLI export/serve integration, toolchain provisioning, and provider commands remain extraction work.
+IndexedDB blob storage is implemented in `src/web_storage.c` with Zig bindings in `src/web_storage.zig`. The backend adds the C source with its emscripten sysroot and imports the `storage` module. Runtime service selection remains explicit. The default loading shell and its staging API/tool are implemented; the provider now stages build output, serves it, and exports it through generic CLI commands and hooks. Toolchain provisioning and build-watch orchestration remain extraction work.
 
 ## Planned responsibilities
 
 - Web toolchain provisioning and build orchestration through the generic provider contract.
-- Local serving, export orchestration, compression, and size reporting.
+- Automatic toolchain provisioning and build-watch orchestration (still pending).
 - Browser storage services through the engine's storage interface.
 
 The provider target remains `wasm`. Backend-specific rendering and emscripten linking remain with backend packages. Custom game pages must remain supported. A default package selection is registry/scaffold data, not a hardcoded CLI package name.
@@ -23,7 +23,7 @@ The provider target remains `wasm`. Backend-specific rendering and emscripten li
 - [Fullscreen canvas sizing: bgfx #130](https://github.com/labelle-toolkit/labelle-bgfx/issues/130)
 - [Persistent browser saves: engine #893](https://github.com/labelle-toolkit/labelle-engine/issues/893)
 
-Migration is breaking: existing web projects explicitly add and pin the provider. Introduce the package manifest after the contract decisions are settled. Verify browser startup, resize/fullscreen, custom-shell behavior, and save persistence when those features land.
+Migration is breaking: existing web projects explicitly add and pin the provider. Verify browser startup, resize/fullscreen, custom-shell behavior, and save persistence when those features land.
 
 ## Default browser shell
 
@@ -112,15 +112,70 @@ page source and optional wasm byte count. Both directory arguments are open
 for local serve and export; stage custom assets first and pass their original
 source directory. I/O errors propagate instead of silently falling back.
 
-This PR delivers the shell portion of CLI #402 inside `labelle-web`, per CLI
-#406. It does **not** yet make `labelle init`, `wasm export`, or `wasm serve`
-select this package automatically. The remaining web-provider extraction must
-call this API at the points above and preserve project page precedence. No CLI
-platform special case or premature target ownership is added here.
+The provider uses this API automatically after build and before serving/export.
+Its private `.labelle-shell-state.json` tracks the original emitted page so
+repeated staging restamps it and removing a project override restores the
+emitted/default page. The server hides this file; exports omit it.
+
+## CLI provider
+
+Requires Zig 0.16.0 and a CLI with generic provider commands/hooks. Add this
+package explicitly to `project.labelle`'s `.plugins`, using a pinned release or
+commit (until released, a `local:/absolute/path/to/labelle-web` checkout works).
+The dependency name is `web`; the repository is `labelle-toolkit/labelle-web`.
+For remote pins, run `labelle providers resolve`, review the proposed pins,
+then repeat with `--accept` to update the lock. The package claims target `wasm` and
+namespace `web`; do not declare another owner for the same target/namespace.
+
+```sh
+labelle build --platform=wasm              # build, then stage the sized shell
+labelle run --platform=wasm                # build, stage, and serve
+labelle bundle --platform=wasm             # build and package through the hook
+labelle web serve --port=8080 --no-open    # serve an existing build
+labelle web export --output=dist --zip --platform=github-pages
+```
+
+Provider commands consume existing build output. They discover exactly one
+`.labelle/*_wasm/zig-out/web` directory containing `game.wasm`; use
+`--input=/absolute/path/to/web` when multiple backends have been built.
+`game.js` and `game.wasm` are required. Arguments use `--name=value` syntax;
+export platform is optional (`itch` or `github-pages`). GitHub Pages export
+adds `.nojekyll`. ZIP archives contain the final staged files.
+
+Project `web/` resources are copied alongside the selected page. Root filenames
+`game.js`, `game.wasm`, `game.data`, `labelle-loader.js`, `labelle-logo.png` and
+`.labelle-shell-state.json` are reserved; custom assets cannot replace them.
+Exports run optional `wasm-opt` before size stamping, invalidate stale compressed
+copies of changed artifacts, and report the shipped tree. Destination paths
+cannot overlap inputs or replace the project/custom-page directory; unrelated
+nonempty directories are refused.
+
+Map a provider-owned JSON file in `project.labelle` when hooks need settings:
+
+```zig
+.provider_config = .{
+    .{ .package = "web", .file = "web-provider.json" },
+},
+```
+
+```json
+{ "build_dir": ".labelle/bgfx_wasm/zig-out/web", "port": 8080, "open_browser": false }
+```
+
+All keys are optional. `build_dir` selects existing output for commands and the
+bundle hook; build/run hooks receive the current target output directly.
+Unknown keys are rejected. Command flags override settings.
+
+Use these namespaced commands instead of legacy `labelle wasm serve/export`.
+The paired CLI migration guard refuses legacy verbs when a provider replaces
+`run`: their export behavior and serve flags cannot be represented by that hook.
+Automatic `init` selection, SDK provisioning, and automatic rebuild/watch are
+outside this extraction. The HTTP server serves raw artifacts and retains the CLI server’s request-path
+checks; provider serve does not start a watcher.
 
 ### Validation
 
-`zig build test install-shell` checks the Zig bindings, staging precedence,
+`zig build test install-shell install-provider` checks the Zig bindings, staging precedence,
 size substitution, restamping and invalid inputs, and builds the host tool.
 
 ```sh
@@ -136,3 +191,13 @@ in Chromium, Firefox and WebKit. CI also compiles `tests/shell/main.c` with
 Emscripten 4.0.9 and verifies that its actual glue reaches `main` through the shell.
 Set `EMCC_FIXTURE` to that output directory to repeat the real-glue test locally.
 The logo is copied from `labelle-assembler/src/assets/default_icon.png`.
+
+Provider integration checks use a built CLI:
+
+```sh
+python3 tests/provider/e2e.py --cli /absolute/path/to/labelle --zig /absolute/path/to/zig
+```
+
+These exercise real command discovery/export/HTTP serving and strict build/bundle
+hook contexts, custom-page removal, final optimized size stamping, ZIP contents,
+multiple-backend selection, and destructive-path rejection.
