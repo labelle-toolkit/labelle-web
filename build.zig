@@ -5,6 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     _ = b.addModule("storage", .{ .root_source_file = b.path("src/web_storage.zig"), .target = target, .optimize = optimize, .link_libc = true });
 
+    _ = b.addModule("labelle_web", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    const provider_module = b.createModule(.{ .root_source_file = b.path("src/provider_main.zig"), .target = b.graph.host, .optimize = optimize, .link_libc = true });
+    const provider = b.addExecutable(.{ .name = "labelle-web", .root_module = provider_module });
+    b.step("install-provider", "Install provider commands and hooks").dependOn(&b.addInstallArtifact(provider, .{}).step);
+    const provider_tests = b.addRunArtifact(b.addTest(.{ .root_module = provider_module }));
+    b.step("test-provider", "Test provider packaging, HTTP and wire contract").dependOn(&provider_tests.step);
     const shell = b.addModule("shell", .{ .root_source_file = b.path("src/shell.zig"), .target = target, .optimize = optimize });
     const shell_tests = b.addTest(.{ .root_module = shell });
     const run_shell_tests = b.addRunArtifact(shell_tests);
@@ -35,4 +41,5 @@ pub fn build(b: *std.Build) void {
     _ = check.getEmittedBin(); // run codegen too, not only analysis
     test_step.dependOn(&check.step);
     test_step.dependOn(&run_shell_tests.step);
+    test_step.dependOn(&provider_tests.step);
 }

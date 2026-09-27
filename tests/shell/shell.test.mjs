@@ -42,6 +42,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
       const logo = await readFile(join(dir, 'labelle-logo.png'));
       const realDir = process.env.EMCC_FIXTURE && resolve(process.env.EMCC_FIXTURE);
       if (realDir) execFileSync(tool, [realDir]);
+      const heldTransfers = new Set();
       server = createServer(async (req, res) => {
         const parts = new URL(req.url, 'http://localhost').pathname.split('/');
         const mode = parts[1];
@@ -78,6 +79,9 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           let offset = 0;
           const interval = setInterval(() => {
             if (mode === 'stream-failure' && offset > 32768) { clearInterval(interval); res.destroy(); return; }
+            // Keep the response incomplete until the test has observed progress.
+            // CI scheduling can otherwise finish the transfer between assertions.
+            if (offset >= 65536 && heldTransfers.has(mode)) return;
             if (offset >= data.length) { clearInterval(interval); res.end(); return; }
             res.write(data.subarray(offset, offset += 16384));
           }, 20);
@@ -105,6 +109,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
       }
       for (const mode of ['slow', 'gzip', 'unknown', 'fallback']) {
         await t.test(mode + ': counted download, startup, DPR and resize', async () => {
+          heldTransfers.add(mode);
           const { page, errors } = await pageFor(mode, mode === 'fallback' ? () => { WebAssembly.instantiateStreaming = undefined; } : undefined);
           try {
             await page.waitForFunction(() => /^[1-9]/.test(document.querySelector('#loading-status').textContent));
@@ -114,6 +119,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
               const value = await page.locator('progress').evaluate(el => el.value);
               assert.ok(value > 0 && value < 1, 'intermediate progress is observable');
             }
+            heldTransfers.delete(mode);
             await page.waitForFunction(() => window.gameReady);
             assert.equal(await page.evaluate(() => window.receivedWasm), true);
             const observed = await page.evaluate(() => window.byteText);
@@ -123,7 +129,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
             await page.setViewportSize({ width: 640, height: 480 });
             await page.waitForFunction(() => canvas.width === 1280 && canvas.height === 960);
             assert.deepEqual(errors, []);
-          } finally { await page.close(); }
+          } finally { heldTransfers.delete(mode); await page.close(); }
         });
       }
       for (const mode of ['http-failure', 'compile-failure', 'js-failure', 'stream-failure', 'loader-failure']) {

@@ -1,0 +1,16 @@
+.{
+    .name = "web",
+    .manifest_version = 2,
+    .command_contract = ">=1.0.0 <1.2.0",
+    .namespace = "web",
+    .targets = .{"wasm"},
+    .commands = .{
+        .{ .name = "serve", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Stage and serve a built web game" },
+        .{ .name = "export", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Export a built web game with a sized loading shell" },
+    },
+    .hooks = .{
+        .{ .id = "shell", .step = .build, .target = "wasm", .when = .after, .build_step = "install-provider", .executable = "bin/labelle-web" },
+        .{ .id = "serve", .step = .run, .target = "wasm", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-web" },
+        .{ .id = "export", .step = .bundle, .target = "wasm", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-web" },
+    },
+}

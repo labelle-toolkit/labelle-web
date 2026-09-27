@@ -27,7 +27,7 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
       - name: zig build
-        run: zig build install-shell --summary all
+        run: zig build install-shell install-provider --summary all
       # Compiles the Zig bindings for wasm32-emscripten (no emsdk needed).
       - name: zig build test
         run: zig build test --summary all
@@ -129,3 +129,29 @@ jobs:
         working-directory: tests/shell
       - run: npm test
         working-directory: tests/shell
+
+  provider:
+    name: Provider commands and hooks (real CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: c9cc9682781990e6ae69b4b96c44b309045e1b21
+          path: .test-cli
+          persist-credentials: false
+      - run: zig build
+        working-directory: .test-cli
+      - run: zig build install-provider
+      - name: Exercise CLI discovery, serving, export and hook contexts
+        run: python3 tests/provider/e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
