@@ -1,1 +1,1 @@
-.{ .name = .labelle_web, .fingerprint = 0xfee6329a9b9f38af, .version = "0.1.0", .minimum_zig_version = "0.16.0", .paths = .{ "build.zig", "build.zig.zon", "src", "tests/bindings_check.zig", "README.md", "plugin.labelle" } }
+.{ .name = .labelle_web, .fingerprint = 0xfee6329a9b9f38af, .version = "0.2.0", .minimum_zig_version = "0.16.0", .paths = .{ "build.zig", "build.zig.zon", "src", "tests/bindings_check.zig", "README.md", "plugin.labelle" } }
