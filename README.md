@@ -254,10 +254,11 @@ server stops at the deadline and exits 0, as on Ctrl+C.
 `labelle run` options (`--scene`, `--profile`, `--screenshot`, `--after`)
 reach the `serve` hook as `run.env` (`LABELLE_SCENE`, ...). A browser game
 has no process environment, so every served HTML page gets them in a script
-placed ahead of every page script: right after the first real `<head>` tag,
-the first `<script>` or `<body>` tag, whichever comes first (comments are
-skipped; with none of them, after the `<!doctype>`, else at the start), with
-every `<` in the values escaped: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
+placed right after its leading `<!doctype>` (byte-order marks, whitespace
+and comments ahead of it are skipped; with no doctype, at the very start).
+The HTML parser puts a script found before `<html>` first in `<head>`, so it
+runs before every page script, whatever the page's markup. Every `<` in the
+values is escaped: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
 plus a `Module.preRun` step that copies them into Emscripten's `ENV` before
 `main`. The game's `getenv` then sees them as on desktop; the engine's
 `requestedScene()` reads `LABELLE_SCENE` through `getenv`. The script extends
@@ -323,7 +324,11 @@ npm test
 
 Browser tests throttle a valid wasm download and exercise byte progress, gzip,
 unknown size, buffered fallback, errors, callback preservation and canvas sizing
-in Chromium, Firefox and WebKit. CI also compiles `tests/shell/main.c` with
+in Chromium, Firefox and WebKit. They also run the provider's `serve` hook
+(`zig-out/bin/labelle-web`, or `PROVIDER_EXE`) with `run.env` on a page with
+no `<head>` and early, `<noscript>`, `<template>` and SVG scripts, and check
+that every executable one already sees `LABELLE_RUN_ENV` in standards mode.
+CI also compiles `tests/shell/main.c` with
 Emscripten 4.0.9 and verifies that its actual glue reaches `main` through the shell.
 Set `EMCC_FIXTURE` to that output directory to repeat the real-glue test locally.
 The logo is copied from `labelle-assembler/src/assets/default_icon.png`.

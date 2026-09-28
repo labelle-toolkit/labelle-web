@@ -482,7 +482,8 @@ fn handleConnection(
     };
     defer allocator.free(body);
 
-    // Served HTML gets the `labelle run` options first in <head> and, in a
+    // Served HTML gets the `labelle run` options right after its doctype
+    // (so first in <head>, per the HTML parser) and, in a
     // watch session, the reload client seeded with its generation. Other
     // assets pass through untouched.
     const is_html = std.mem.startsWith(u8, content_type, "text/html");
@@ -615,7 +616,8 @@ fn reloadClient(allocator: std.mem.Allocator, generation: u64) ![]u8 {
 }
 
 /// The `labelle run` options (`run.env`: `LABELLE_SCENE`, `LABELLE_PROFILE`,
-/// ...) for a page, as a script placed first in `<head>`: it publishes them
+/// ...) for a page, as a script placed right after the doctype, which the
+/// HTML parser makes the first child of `<head>`: it publishes them
 /// as `window.LABELLE_RUN_ENV` and adds a `Module.preRun` step copying them
 /// into Emscripten's `ENV`, so the game's `getenv` (the engine's
 /// `requestedScene()` reads `LABELLE_SCENE`) sees them as on desktop. The
@@ -668,152 +670,39 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
     return std.mem.concat(allocator, u8, &.{ html, script });
 }
 
-/// Splice `script` ahead of every page script: right after the opening
-/// `<head ...>` tag, the first page `<script>` or the opening `<body ...>`
-/// tag, whichever comes first. So a page with no real `<head>` and a
-/// synchronous script ahead of `<body>` still sees the options before it
-/// runs. With none of them, it goes after the `<!doctype ...>` (never ahead
-/// of it, which would put the page in quirks mode), else at the start. The
-/// tags are found by `findTag`, a small tokenizer that skips comments,
-/// raw-text element content and attribute values.
+/// Splice `script` right after the leading `<!doctype ...>`, else at the
+/// very start. Per the HTML parsing spec, a `<script>` ahead of `<html>`
+/// becomes the first child of `<head>` (the parser creates `<html>` and
+/// `<head>` for it), so it runs before every page script, whatever the
+/// page's markup (no `<head>`, early scripts, templates, SVG, ...). After
+/// the doctype, not ahead of it, which would put the page in quirks mode.
 fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
-    var at: ?usize = null;
-    if (findTag(html, "head")) |t| at = t.end;
-    if (findTag(html, "script")) |t| at = @min(at orelse t.start, t.start);
-    if (findTag(html, "body")) |t| at = @min(at orelse t.end, t.end);
-    const pos = at orelse doctypeEnd(html);
+    const pos = doctypeEnd(html);
     return std.mem.concat(allocator, u8, &.{ html[0..pos], script, html[pos..] });
 }
 
-/// The index just past a leading `<!doctype ...>` (after optional
-/// whitespace), else 0.
+/// The index just past the leading `<!doctype ...>` (case-insensitive),
+/// skipping only byte-order marks, whitespace and `<!-- ... -->` comments
+/// ahead of it; else 0. The doctype ends at its first `>`, as the HTML
+/// tokenizer ends it.
 fn doctypeEnd(html: []const u8) usize {
-    const lead = html.len - std.mem.trimStart(u8, html, " \t\r\n").len;
-    const rest = html[lead..];
+    const bom = "\xEF\xBB\xBF";
+    var i: usize = 0;
+    while (i < html.len) {
+        if (std.mem.startsWith(u8, html[i..], bom)) {
+            i += bom.len;
+        } else if (std.ascii.isWhitespace(html[i])) {
+            i += 1;
+        } else if (std.mem.startsWith(u8, html[i..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, html, i + 4, "-->") orelse return 0;
+            i = close + 3;
+        } else break;
+    }
+    const rest = html[i..];
     if (rest.len < "<!doctype".len or !std.ascii.eqlIgnoreCase(rest[0.."<!doctype".len], "<!doctype")) return 0;
-    const gt = std.mem.indexOfScalarPos(u8, html, lead, '>') orelse return 0;
+    const gt = std.mem.indexOfScalarPos(u8, html, i, '>') orelse return 0;
     return gt + 1;
 }
-
-/// The index just past the `>` of the first real `<name ...>` start tag.
-fn tagEnd(html: []const u8, name: []const u8) ?usize {
-    return if (findTag(html, name)) |t| t.end else null;
-}
-
-const Tag = struct { start: usize, end: usize };
-
-/// The first real `<name ...>` start tag: `start` at its `<`, `end` just
-/// past its `>`. Found by `StartTags`, so text inside comments, raw-text
-/// elements and attribute values never matches, and the name matches
-/// case-insensitively and whole (`<header>` is not `<head>`).
-fn findTag(html: []const u8, name: []const u8) ?Tag {
-    var tags: StartTags = .{ .html = html };
-    while (tags.next()) |t| if (std.ascii.eqlIgnoreCase(t.name, name)) return .{ .start = t.start, .end = t.end };
-    return null;
-}
-
-/// A small HTML tokenizer that yields start tags in document order. It
-/// skips `<!-- ... -->` comments, `<!doctype>`-like and `<?...>`
-/// declarations, end tags, the content of raw-text elements (`<script>`,
-/// `<style>`, `<textarea>`, `<title>`, ...) up to their closing tag, and
-/// quoted attribute values (which may contain `<` and `>`), and never
-/// yields a tag inside `<template>` content, nested or not. Anything
-/// unterminated (a comment, a tag, a raw-text element, a template) hides
-/// the rest of the page.
-const StartTags = struct {
-    html: []const u8,
-    i: usize = 0,
-    /// Open `<template>` levels: nothing inside one is yielded.
-    template_depth: usize = 0,
-
-    const raw_text = [_][]const u8{ "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes" };
-
-    const Found = struct { name: []const u8, start: usize, end: usize };
-
-    fn next(self: *StartTags) ?Found {
-        const html = self.html;
-        while (std.mem.indexOfScalarPos(u8, html, self.i, '<')) |lt| {
-            const rest = html[lt..];
-            if (std.mem.startsWith(u8, rest, "<!--")) {
-                const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return self.stop();
-                self.i = close + 3;
-                continue;
-            }
-            if (rest.len > 1 and (rest[1] == '!' or rest[1] == '?' or rest[1] == '/')) {
-                // Declarations and end tags: skip to their `>`. A
-                // `</template>` closes one level of template content.
-                const gt = std.mem.indexOfScalarPos(u8, html, lt + 1, '>') orelse return self.stop();
-                if (rest[1] == '/' and self.template_depth > 0 and std.ascii.eqlIgnoreCase(tagName(html, lt + 2), "template"))
-                    self.template_depth -= 1;
-                self.i = gt + 1;
-                continue;
-            }
-            if (rest.len < 2 or !std.ascii.isAlphabetic(rest[1])) {
-                self.i = lt + 1; // a bare `<` in text
-                continue;
-            }
-            const name = tagName(html, lt + 1);
-            const end = attributesEnd(html, lt + 1 + name.len) orelse return self.stop();
-            self.i = end;
-            for (raw_text) |raw| if (std.ascii.eqlIgnoreCase(name, raw)) {
-                self.i = closingTag(html, end, raw) orelse html.len;
-                break;
-            };
-            // Template content is inert, however deeply nested: count the
-            // levels and yield nothing inside them.
-            if (std.ascii.eqlIgnoreCase(name, "template")) {
-                self.template_depth += 1;
-                continue;
-            }
-            if (self.template_depth > 0) continue;
-            return .{ .name = name, .start = lt, .end = end };
-        }
-        return self.stop();
-    }
-
-    /// The tag name starting at `from`: up to whitespace, `/` or `>`.
-    fn tagName(html: []const u8, from: usize) []const u8 {
-        var j = from;
-        while (j < html.len and !std.ascii.isWhitespace(html[j]) and html[j] != '/' and html[j] != '>') j += 1;
-        return html[from..j];
-    }
-
-    fn stop(self: *StartTags) ?Found {
-        self.i = self.html.len;
-        return null;
-    }
-
-    /// Past the `>` closing a start tag whose name ends at `from`: quoted
-    /// values (after `=`) are skipped whole.
-    fn attributesEnd(html: []const u8, from: usize) ?usize {
-        var j = from;
-        while (j < html.len) : (j += 1) switch (html[j]) {
-            '>' => return j + 1,
-            '=' => {
-                j += 1;
-                while (j < html.len and std.ascii.isWhitespace(html[j])) j += 1;
-                if (j < html.len and (html[j] == '"' or html[j] == '\'')) {
-                    j = std.mem.indexOfScalarPos(u8, html, j + 1, html[j]) orelse return null;
-                } else j -= 1;
-            },
-            else => {},
-        };
-        return null;
-    }
-
-    /// The index of `</name` (any case, then whitespace, `/` or `>`) at or
-    /// after `from`: where a raw-text element's content ends.
-    fn closingTag(html: []const u8, from: usize, name: []const u8) ?usize {
-        var k = from;
-        while (std.mem.indexOfPos(u8, html, k, "</")) |at| {
-            const e = at + 2 + name.len;
-            if (e <= html.len and std.ascii.eqlIgnoreCase(html[at + 2 .. e], name) and
-                (e == html.len or html[e] == '>' or html[e] == '/' or std.ascii.isWhitespace(html[e]))) return at;
-            k = at + 2;
-        }
-        return null;
-    }
-};
 
 /// The reload client for `generation`, before `</body>`.
 fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8, generation: u64) ![]u8 {
@@ -1182,7 +1071,7 @@ test "handleConnection: a watch session seeds the reload client with the served 
     try std.testing.expect(std.mem.indexOf(u8, page, "if (v !== current) { location.reload(); return; }") != null);
 }
 
-test "handleConnection: run options reach the page first in <head>; the endpoint stays a file outside watch" {
+test "handleConnection: run options reach the page right after the doctype; the endpoint stays a file outside watch" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1201,7 +1090,8 @@ test "handleConnection: run options reach the page first in <head>; the endpoint
     const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
     defer alloc.free(page);
     const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro\\u003c/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
-    try std.testing.expect(env_at > std.mem.indexOf(u8, page, "<HEAD lang=en>").?);
+    try std.testing.expect(std.mem.startsWith(u8, page[std.mem.indexOf(u8, page, "<!doctype html>").? + "<!doctype html>".len ..], "<script>"));
+    try std.testing.expect(env_at < std.mem.indexOf(u8, page, "<html>").?);
     try std.testing.expect(env_at < std.mem.indexOf(u8, page, "var Module={}").?);
     try std.testing.expect(std.mem.indexOf(u8, page, "location.reload") == null);
     const asset = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
@@ -1224,50 +1114,25 @@ test "runEnvScript: no `<` reaches the script element, whatever its case" {
     try std.testing.expectEqualStrings("a</ScRiPt><!--b", parsed.value.object.get("LABELLE_SCENE").?.string);
 }
 
-test "tagEnd skips comments, matches whole names in any case, allows attributes" {
-    const html = "<!doctype html><!-- <head> old --><HTML><header x=1></header><Head data-x=\"a>b\">T</head>";
-    const at = tagEnd(html, "head").?;
-    try std.testing.expectEqualStrings("T</head>", html[at..]);
-    try std.testing.expectEqual(@as(?usize, null), tagEnd("<!-- <head> -->", "head"));
-    try std.testing.expectEqual(@as(?usize, null), tagEnd("<p><!-- unterminated <head>", "head"));
-    const alloc = std.testing.allocator;
-    const got = try injectFirst(alloc, "<!-- <head> --><html><head><title>t</title></head></html>", "S");
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings("<!-- <head> --><html><head>S<title>t</title></head></html>", got);
-    const bare = try injectFirst(alloc, "<!-- <head> --><p>x</p>", "S");
-    defer alloc.free(bare);
-    try std.testing.expectEqualStrings("S<!-- <head> --><p>x</p>", bare);
-}
-
-test "injectFirst: after <head>, else <body>, else at the start; never inside <header>" {
+test "injectFirst: right after the leading doctype, else at the start" {
     const alloc = std.testing.allocator;
     for ([_][2][]const u8{
-        .{ "<html><head><title>t</title></head></html>", "<html><head>S<title>t</title></head></html>" },
-        .{ "<html><body class=x><header>h</header></body></html>", "<html><body class=x>S<header>h</header></body></html>" },
+        // Doctype + head: ahead of <html>, so the parser makes it head's first child.
+        .{ "<!doctype html><html><head><script>a</script></head></html>", "<!doctype html>S<html><head><script>a</script></head></html>" },
+        // No head, an early script: the block comes before it.
+        .{ "<!DOCTYPE html><html><script>var Module={};</script><body></body></html>", "<!DOCTYPE html>S<html><script>var Module={};</script><body></body></html>" },
+        // BOM, whitespace and comments ahead of the doctype are skipped.
+        .{ "\xEF\xBB\xBF<!doctype html><p>x</p>", "\xEF\xBB\xBF<!doctype html>S<p>x</p>" },
+        .{ " \r\n\t<!DocType html>\n<p>x</p>", " \r\n\t<!DocType html>S\n<p>x</p>" },
+        .{ "\xEF\xBB\xBF <!-- a <!doctype x> in a comment --> <!-- b --><!doctype html><html>", "\xEF\xBB\xBF <!-- a <!doctype x> in a comment --> <!-- b --><!doctype html>S<html>" },
+        .{ "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><html>", "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\">S<html>" },
+        // No doctype (or not leading): at the start.
+        .{ "<html><head></head></html>", "S<html><head></head></html>" },
         .{ "<p>fragment</p>", "S<p>fragment</p>" },
-        // No <head>: before the first script, even one ahead of <body>.
-        .{ "<!DOCTYPE html><html><script>var Module={};</script><body><canvas></canvas></body></html>", "<!DOCTYPE html><html>S<script>var Module={};</script><body><canvas></canvas></body></html>" },
-        .{ "<!doctype html><SCRIPT src=early.js></SCRIPT><body></body>", "<!doctype html>S<SCRIPT src=early.js></SCRIPT><body></body>" },
-        .{ "<!-- <script> --><html><body><script>x</script></body></html>", "<!-- <script> --><html><body>S<script>x</script></body></html>" },
-        .{ "<html><scripts></scripts><body>b</body></html>", "<html><scripts></scripts><body>Sb</body></html>" },
-        // Neither head, script nor body: after the doctype, never ahead of it.
-        .{ "<!DOCTYPE html>\n<p>x</p>", "<!DOCTYPE html>S\n<p>x</p>" },
-        .{ "  <!doctype html><p>x</p>", "  <!doctype html>S<p>x</p>" },
-        // Tag-like text in raw-text content or attribute values is not a tag.
-        .{ "<html><style>x::after{content:\"<script>\"}</style><body><p>x</p></body></html>", "<html><style>x::after{content:\"<script>\"}</style><body>S<p>x</p></body></html>" },
-        .{ "<html><head data-x=\"<script>\"><script>a</script></head></html>", "<html><head data-x=\"<script>\">S<script>a</script></head></html>" },
-        .{ "<html><p title='<body>'>x</p><title><script></title><script>a</script>", "<html><p title='<body>'>x</p><title><script></title>S<script>a</script>" },
-        .{ "<html><textarea><body></TEXTAREA ><body>b", "<html><textarea><body></TEXTAREA ><body>Sb" },
-        .{ "<!doctype html><script>var s=\"<body>\";</script>", "<!doctype html>S<script>var s=\"<body>\";</script>" },
-        .{ "<!doctype html><style><body>", "<!doctype html>S<style><body>" },
-        // Template content is inert, however nested; unterminated, it hides the rest.
-        .{ "<!doctype html><html><template><script>t</script></template><body><script>b</script></body>", "<!doctype html><html><template><script>t</script></template><body>S<script>b</script></body>" },
-        .{ "<html><template><template><p/></template><script>t</script><body></template><script>a</script>", "<html><template><template><p/></template><script>t</script><body></template>S<script>a</script>" },
-        .{ "<html><TEMPLATE x=\"</template>\"><style></template></style><script>t</script></Template ><script>a</script>", "<html><TEMPLATE x=\"</template>\"><style></template></style><script>t</script></Template >S<script>a</script>" },
-        .{ "<!DOCTYPE html><template><template></template><script>t</script><body>b", "<!DOCTYPE html>S<template><template></template><script>t</script><body>b" },
-        // A script ahead of a late <head> runs before it: go first.
-        .{ "<script>a</script><head><title>t</title></head>", "S<script>a</script><head><title>t</title></head>" },
-        .{ "<html><head><script>a</script></head><script>b</script>", "<html><head>S<script>a</script></head><script>b</script>" },
+        .{ "<p>x</p><!doctype html>", "S<p>x</p><!doctype html>" },
+        .{ "<!-- unterminated <!doctype html>", "S<!-- unterminated <!doctype html>" },
+        .{ "<!doctype html", "S<!doctype html" },
+        .{ "", "S" },
     }) |case| {
         const got = try injectFirst(alloc, case[0], "S");
         defer alloc.free(got);

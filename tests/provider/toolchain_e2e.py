@@ -395,13 +395,17 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
             assert "__labelle_livereload" in page and 'data-wasm-bytes="8"' in page, page
             # Seeded with the generation it was served from (no first-poll baseline).
             assert 'var current = "0";' in page, page
-            # run.env reaches the page ahead of every page script, and its
+            # run.env reaches the page ahead of every page script (right after
+            # the doctype), and its
             # preRun step copies it into Emscripten's ENV (what getenv reads).
             assert 'window.LABELLE_RUN_ENV = {"LABELLE_SCENE":"intro"};' in page, page
             assert page.index("LABELLE_RUN_ENV") < page.index("LabelleLoader"), page
+            # Right after the doctype: the parser makes it head's first child.
+            doctype_end = page.index(">", page.lower().index("<!doctype")) + 1
+            assert page[doctype_end:].startswith("<script>") and "window.LABELLE_RUN_ENV" in page[doctype_end:page.index("</script>", doctype_end)], page[:300]
             node = shutil.which("node")
             if node:
-                start = page.index("<script>", page.index("<head")) + len("<script>")
+                start = page.rindex("<script>", 0, page.index("window.LABELLE_RUN_ENV")) + len("<script>")
                 script = page[start:page.index("</script>", start)]
                 probe = ("const vm=require('vm');const ctx={window:{}};vm.createContext(ctx);"
                          "vm.runInContext(process.argv[1],ctx);ctx.ENV={};"
