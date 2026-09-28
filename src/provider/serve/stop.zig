@@ -81,9 +81,10 @@ pub fn wakeLoop(io: std.Io, port: u16, cancel: *const std.atomic.Value(bool), st
 }
 
 /// Deadline thread body (`labelle run --timeout`, `run.timeout_ms`): once
-/// `ms` have passed, ask for the same clean stop Ctrl+C asks for, so the
-/// server returns and the provider exits 0. `stop` ends it early.
-pub fn deadlineLoop(io: std.Io, ms: u64, cancel: *std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+/// `ms` have passed, set `fired` and then ask for the same clean stop
+/// Ctrl+C asks for, so the server returns, knows the deadline ended it, and
+/// the provider exits 0. `stop` ends it early.
+pub fn deadlineLoop(io: std.Io, ms: u64, cancel: *std.atomic.Value(bool), stop: *const std.atomic.Value(bool), fired: *std.atomic.Value(bool)) void {
     const tick: u64 = 20;
     var waited: u64 = 0;
     while (waited < ms) {
@@ -94,6 +95,8 @@ pub fn deadlineLoop(io: std.Io, ms: u64, cancel: *std.atomic.Value(bool), stop: 
     }
     if (stop.load(.acquire)) return;
     std.debug.print("labelle-web: run timeout ({d} ms) reached; stopping the server\n", .{ms});
+    // Before the stop, so whoever sees the stop also sees why.
+    fired.store(true, .release);
     cancel.store(true, .release);
 }
 
@@ -101,11 +104,12 @@ test "deadlineLoop: sets the stop flag after the deadline, not when stopped firs
     const io = std.testing.io;
     var cancel: std.atomic.Value(bool) = .init(false);
     var stop: std.atomic.Value(bool) = .init(true);
-    deadlineLoop(io, 10_000, &cancel, &stop);
-    try std.testing.expect(!cancel.load(.acquire));
+    var fired: std.atomic.Value(bool) = .init(false);
+    deadlineLoop(io, 10_000, &cancel, &stop, &fired);
+    try std.testing.expect(!cancel.load(.acquire) and !fired.load(.acquire));
     stop.store(false, .release);
-    deadlineLoop(io, 30, &cancel, &stop);
-    try std.testing.expect(cancel.load(.acquire));
+    deadlineLoop(io, 30, &cancel, &stop, &fired);
+    try std.testing.expect(cancel.load(.acquire) and fired.load(.acquire));
 }
 
 test "wakeLoop: pokes the listener once the flag is set and ends on stop without one" {

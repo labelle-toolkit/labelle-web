@@ -535,6 +535,27 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert 'run timeout (700 ms) reached' in timed.stderr, timed.stderr
     assert timed.stdout == ''
     assert 0.7 <= took < 30, took
+    # Wire 1.5.0 (labelle-cli#473): the same deadline is reported through
+    # run.outcome_file, so the CLI skips the `after run` hooks; on the 1.3.0
+    # wire above there is no such key and nothing is written.
+    with socket.socket() as free_port:
+        free_port.bind(('127.0.0.1', 0))
+        port = free_port.getsockname()[1]
+    timeout_config.write_text(json.dumps(dict(schema_version=1, port=port, open_browser=False)))
+    outcome_dir = temp / 'outcome'
+    outcome_dir.mkdir()
+    outcome_file = outcome_dir / 'outcome'
+    context.update(contract_version='1.5.0', final_step='run', run=dict(env=[], args=[], timeout_ms=700, watch=None, outcome_file=str(outcome_file)))
+    ctxfile.write_text(json.dumps(context))
+    began = time.monotonic()
+    reported = subprocess.run([exe], cwd=project, env=dict(env, LABELLE_CONTEXT=str(ctxfile)), capture_output=True, text=True, timeout=60)
+    took = time.monotonic() - began
+    assert reported.returncode == 0, reported.stderr
+    assert 'run timeout (700 ms) reached' in reported.stderr, reported.stderr
+    assert outcome_file.read_text() == 'timeout\n', outcome_file.read_text()
+    assert 0.7 <= took < 30, took
+    del context['final_step']
+    context.update(contract_version='1.3.0', run=dict(env=[], args=[], timeout_ms=700, watch=None))
     # Several generated backends cannot silently choose the wrong wasm.
     other = project / '.labelle/other_wasm/zig-out/web'
     other.mkdir(parents=True)
