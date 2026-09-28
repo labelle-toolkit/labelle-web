@@ -19,6 +19,8 @@ p.add_argument('--cli', required=True)
 p.add_argument('--zig', required=True)
 a = p.parse_args()
 cli, zig = str(Path(a.cli).resolve()), str(Path(a.zig).resolve())
+if os.name == 'nt':  # bash's `command -v zig` drops the suffix LABELLE_ZIG needs
+    cli, zig = (x if x.lower().endswith('.exe') else x + '.exe' for x in (cli, zig))
 repo = Path(__file__).resolve().parents[2]
 exe = repo / 'zig-out/bin' / ('labelle-web.exe' if os.name == 'nt' else 'labelle-web')
 version = subprocess.check_output([zig, 'version'], text=True).strip()
