@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -45,9 +46,24 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
             assert 'leaked' not in result.stderr, result.stderr
         return result
     assert 'web export' in run('help').stderr
-    # Old export shares the CLI run phase: it must refuse a server replacement.
-    for verb in ('serve', 'export'):
-        run('wasm', verb, '--no-build', fail='legacy `wasm serve/export`')
+    # Which `wasm` behaviour to expect is judged by the CLI's own version
+    # (`labelle --version`, as labelle-android's e2e does), never by the
+    # output under test, so a regression cannot read as the other CLI's
+    # answer. A CLI built from source reports build.zig.zon's version
+    # unless built with `-Dversion=<tag>`, as its release is.
+    probe = subprocess.run([cli, '--version'], env=env, text=True, capture_output=True, timeout=60)
+    cli_version = (probe.stdout + probe.stderr).strip()
+    match = re.search(r'(\d+)\.(\d+)\.(\d+)', cli_version)
+    assert probe.returncode == 0 and match, (probe.returncode, cli_version)
+    if tuple(int(x) for x in match.groups()) >= (3, 0, 0):
+        # CLI 3.0.0 (labelle-cli#483) removed `wasm` from the core.
+        for verb in ('serve', 'export'):
+            run('wasm', verb, '--no-build', fail="unknown command 'wasm'")
+    else:
+        # TODO(#14): drop this 2.x branch once CI's CLI pin moves to 3.0.0.
+        # Old export shares the CLI run phase: it must refuse a server replacement.
+        for verb in ('serve', 'export'):
+            run('wasm', verb, '--no-build', fail='legacy `wasm serve/export`')
     run('web', 'export', '--output=dist', '--zip', '--platform=github-pages')
     dist = project / 'dist'
     assert 'data-wasm-bytes="8"' in (dist / 'index.html').read_text()
