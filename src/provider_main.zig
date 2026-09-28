@@ -32,6 +32,8 @@ const Options = struct {
     platform: ?exporter.Platform = null,
     /// The `run.env` of a `run` hook, for the served page.
     run_env: []const server.RunEnv = &.{},
+    /// `run.timeout_ms` (`labelle run --timeout`): stop serving then, exit 0.
+    timeout_ms: ?u64 = null,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -110,6 +112,7 @@ fn execute(init: std.process.Init) !void {
             const page_env = try a.alloc(server.RunEnv, run.env.len);
             for (run.env, page_env) |from, *to| to.* = .{ .name = from.name, .value = from.value };
             opts.run_env = page_env;
+            opts.timeout_ms = run.timeout_ms;
             if (run.watch) |session| return serveSession(init, settings, opts, .{ .generation_file = session.generation_file, .output_dir = session.output_dir });
             return webAction(init, ctx, settings, opts, .serve);
         }
@@ -257,7 +260,7 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try checkRuntime(io, web);
     try exporter.validateBuildTree(io, std.Io.Dir.cwd(), web);
     const port = opts.port orelse settings.port;
-    try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env);
+    try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms);
 }
 
 fn checkRuntime(io: std.Io, web: []const u8) !void {
@@ -313,7 +316,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
                 // Serve the stamped copy, never the original placeholder-bearing source.
-                try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env);
+                try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms);
             }
         },
     }

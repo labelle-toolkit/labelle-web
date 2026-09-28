@@ -233,6 +233,8 @@ pub const Inputs = struct {
     offline: bool,
     /// The verified Python 3 command (`findPython`), for the launcher.
     python: ?[]const u8 = null,
+    /// The resolved target (`wasm`), naming the generated tree.
+    target: []const u8 = "wasm",
 
     pub fn version(self: Inputs) []const u8 {
         return self.emsdk.version orelse default_version;
@@ -474,23 +476,66 @@ fn packageCurrent(a: std.mem.Allocator, io: std.Io, pkg: []const u8, version: []
     return std.mem.eql(u8, std.mem.trim(u8, recorded, " \r\n"), version);
 }
 
-/// Package mode without network: can every fetched emsdk under the
-/// project's `.labelle/*_wasm/zig-pkg/` already serve `version`? False when
-/// there is none (nothing fetched yet) or one still needs `emsdk install`.
-pub fn packagesReady(a: std.mem.Allocator, io: std.Io, project_dir: []const u8, version: []const u8) !bool {
-    const base = try std.fs.path.join(a, &.{ project_dir, ".labelle" });
-    var dir = std.Io.Dir.cwd().openDir(io, base, .{ .iterate = true }) catch return false;
-    defer dir.close(io);
-    var any = false;
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory or !std.mem.endsWith(u8, entry.name, "_wasm")) continue;
-        for (try findPackages(a, io, try std.fs.path.join(a, &.{ base, entry.name }))) |pkg| {
-            if (!try packageCurrent(a, io, pkg, version)) return false;
-            any = true;
+/// Package mode without network: can every fetched emsdk in the selected
+/// target's `zig-pkg/` already serve `version`? False when there is none
+/// (not generated or nothing fetched yet) or one still needs `emsdk
+/// install`. Only `target_dir` counts: a tree left over from another
+/// backend says nothing about the next build.
+pub fn packagesReady(a: std.mem.Allocator, io: std.Io, target_dir: []const u8, version: []const u8) !bool {
+    const pkgs = try findPackages(a, io, target_dir);
+    if (pkgs.len == 0) return false;
+    for (pkgs) |pkg| if (!try packageCurrent(a, io, pkg, version)) return false;
+    return true;
+}
+
+/// The CLI's default backend when `project.labelle` declares none.
+pub const default_backend = "bgfx";
+
+/// The backend `project.labelle` selects (`.backend = .<name>`), else
+/// `default_backend`. A line scan: `//` comments are ignored.
+pub fn projectBackend(a: std.mem.Allocator, io: std.Io, project_dir: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(a, &.{ project_dir, "project.labelle" });
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return default_backend;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = raw[0 .. std.mem.indexOf(u8, raw, "//") orelse raw.len];
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, line, at, ".backend")) |i| {
+            at = i + ".backend".len;
+            var j = at;
+            while (j < line.len and line[j] == ' ') j += 1;
+            if (j >= line.len or line[j] != '=') continue;
+            j += 1;
+            while (j < line.len and line[j] == ' ') j += 1;
+            if (j >= line.len or line[j] != '.') continue;
+            j += 1;
+            const start = j;
+            while (j < line.len and (std.ascii.isAlphanumeric(line[j]) or line[j] == '_')) j += 1;
+            if (j > start) return line[start..j];
         }
     }
-    return any;
+    return default_backend;
+}
+
+/// `<project>/.labelle/<backend>_<target>`: the generated tree a build of
+/// `target` uses, as the CLI names it.
+pub fn selectedTargetDir(a: std.mem.Allocator, io: std.Io, project_dir: []const u8, target: []const u8) ![]const u8 {
+    const backend = try projectBackend(a, io, project_dir);
+    return std.fs.path.join(a, &.{ project_dir, ".labelle", try std.fmt.allocPrint(a, "{s}_{s}", .{ backend, target }) });
+}
+
+test "projectBackend reads .backend, ignoring comments, else the default" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const a = t.arena.allocator();
+    const project = try t.path(&.{"p"});
+    try std.Io.Dir.cwd().createDirPath(testing.io, project);
+    try testing.expectEqualStrings(default_backend, try projectBackend(a, testing.io, project));
+    const file = try t.path(&.{ "p", "project.labelle" });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = ".{\n    // .backend = .raylib,\n    .backend = .sokol,\n}\n" });
+    try testing.expectEqualStrings("sokol", try projectBackend(a, testing.io, project));
+    const dir = try selectedTargetDir(a, testing.io, project, "wasm");
+    try testing.expectEqualStrings(try t.path(&.{ "p", ".labelle", "sokol_wasm" }), dir);
 }
 
 /// The `emsdk` dependency hash in the target's `build.zig.zon`, if any.

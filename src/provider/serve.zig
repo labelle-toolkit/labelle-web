@@ -120,6 +120,23 @@ fn wakeLoop(io: std.Io, port: u16, cancel: *const std.atomic.Value(bool), stop: 
     }
 }
 
+/// Deadline thread body (`labelle run --timeout`, `run.timeout_ms`): once
+/// `ms` have passed, ask for the same clean stop Ctrl+C asks for, so the
+/// server returns and the provider exits 0. `stop` ends it early.
+fn deadlineLoop(io: std.Io, ms: u64, cancel: *std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+    const tick: u64 = 20;
+    var waited: u64 = 0;
+    while (waited < ms) {
+        if (stop.load(.acquire) or cancel.load(.acquire)) return;
+        const step = @min(tick, ms - waited);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(step)), .awake) catch return;
+        waited += step;
+    }
+    if (stop.load(.acquire)) return;
+    std.debug.print("labelle-web: run timeout ({d} ms) reached; stopping the server\n", .{ms});
+    cancel.store(true, .release);
+}
+
 /// The accept loop. Returns once `cancel` is set — before handling any
 /// connection accepted after the request, so the wake-up poke (or a real
 /// request racing it) is closed unanswered. Per-connection errors never
@@ -180,6 +197,7 @@ pub fn serveAndOpen(
     open_browser_tab: bool,
     session: ?watch.Session,
     run_env: []const RunEnv,
+    timeout_ms: ?u64,
 ) !void {
     const io = config.globalIo();
 
@@ -213,6 +231,12 @@ pub fn serveAndOpen(
         break :blk null;
     };
     defer if (waker) |t| {
+        wstate.stop.store(true, .release);
+        t.join();
+    };
+    // A deadline without its thread would serve forever: fail instead.
+    const deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop }) else null;
+    defer if (deadline) |t| {
         wstate.stop.store(true, .release);
         t.join();
     };
@@ -1247,6 +1271,37 @@ test "serveLoop: returns on a stop request after serving what came before it" {
     // Once set, the loop does not accept at all: a direct call returns
     // without touching the listener (nobody connects here).
     serveLoop(io, alloc, &server, web_dir, null, null, &cancel);
+}
+
+test "serveAndOpen: a run timeout stops the server cleanly at the deadline" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var probe = bound.server;
+    probe.deinit(io);
+    defer cancel_requested.store(false, .release);
+    cancel_requested.store(false, .release);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    // Returns (no error) only because the deadline asked for the stop.
+    try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300);
+    const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try std.testing.expect(cancel_requested.load(.acquire));
+    try std.testing.expect(elapsed >= 300);
+    try std.testing.expect(elapsed < 10_000);
+}
+
+test "deadlineLoop: sets the stop flag after the deadline, not when stopped first" {
+    const io = std.testing.io;
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var stop: std.atomic.Value(bool) = .init(true);
+    deadlineLoop(io, 10_000, &cancel, &stop);
+    try std.testing.expect(!cancel.load(.acquire));
+    stop.store(false, .release);
+    deadlineLoop(io, 30, &cancel, &stop);
+    try std.testing.expect(cancel.load(.acquire));
 }
 
 test "wakeLoop: pokes the listener once the flag is set and ends on stop without one" {

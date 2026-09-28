@@ -488,6 +488,22 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
             if direct.poll() is None:
                 direct.kill()
                 direct.wait()
+    # run.timeout_ms (`labelle run --timeout`): the serve hook stops cleanly at
+    # the deadline and exits 0, on every host.
+    with socket.socket() as free_port:
+        free_port.bind(('127.0.0.1', 0))
+        port = free_port.getsockname()[1]
+    timeout_config = temp / 'timeout-config.json'
+    timeout_config.write_text(json.dumps(dict(schema_version=1, port=port, open_browser=False)))
+    context.update(invocation=dict(kind='hook', id='serve', step='run', phase='replace'), output_dir=str(web.parent), config_file=str(timeout_config), run=dict(env=[], args=[], timeout_ms=700, watch=None))
+    ctxfile.write_text(json.dumps(context))
+    began = time.monotonic()
+    timed = subprocess.run([exe], cwd=project, env=dict(env, LABELLE_CONTEXT=str(ctxfile)), capture_output=True, text=True, timeout=60)
+    took = time.monotonic() - began
+    assert timed.returncode == 0, timed.stderr
+    assert 'run timeout (700 ms) reached' in timed.stderr, timed.stderr
+    assert timed.stdout == ''
+    assert 0.7 <= took < 30, took
     # Several generated backends cannot silently choose the wrong wasm.
     other = project / '.labelle/other_wasm/zig-out/web'
     other.mkdir(parents=True)

@@ -186,8 +186,8 @@ Which emsdk, by settings `emsdk.source`:
    or by someone else (CLI 2.x activates one copy itself), is re-activated for
    the requested version (`emsdk install` adds it, `emsdk activate` switches
    to it). Offline, that re-activation is refused. `labelle web doctor` reports package mode
-   under `LABELLE_OFFLINE` as unavailable unless every fetched tree is already
-   activated for the requested version.
+   under `LABELLE_OFFLINE` as unavailable unless every emsdk fetched for the
+   selected target is already activated for the requested version.
 
 The managed install lives in the provider's cache (the CLI's `cache_dir`,
 `<LABELLE_HOME>/providers/<provider id>/`), shared by every project that pins
@@ -215,9 +215,13 @@ build, so `emcc.bat` runs the same interpreter.
 `labelle web doctor` reports both requirements without installing anything and
 exits non-zero only when one is missing; `labelle doctor` runs it after the core
 checks. `--json` prints one line, the `wasm` capability object
-`{"id":"wasm","required":true,"ok":…,"items":[python, emsdk]}` whose items keep
+`{"id":"wasm","required":true,"ok":…,"items":[python, emsdk, git]}` whose items keep
 labelle-studio's shape (`id`, `name`, `ok`, `fixable`, `size_mb`, `action`,
-`detail`, `hint`).
+`detail`, `hint`). `git` is required only while a managed install is
+pending (the install runs `git clone`); with the managed emsdk installed, an
+external `EMSDK`, `emsdk.root` or package mode it reports ok. Package mode
+under `LABELLE_OFFLINE` is checked against the selected target's tree only
+(`.labelle/<backend>_wasm`, the backend read from `project.labelle`).
 
 ### Browser watch
 
@@ -244,7 +248,8 @@ export platform is optional (`itch` or `github-pages`). GitHub Pages export
 adds `.nojekyll`. ZIP archives contain the final staged files. The writer supports ZIP32
 (up to 65,535 entries and a 4 GiB archive); larger archives return `Zip64Required`.
 The `serve` hook reads `--port=N` and `--no-open` from the arguments after
-`labelle run ... --`.
+`labelle run ... --`. With `labelle run --timeout=<s>` (`run.timeout_ms`) the
+server stops at the deadline and exits 0, as on Ctrl+C.
 
 `labelle run` options (`--scene`, `--profile`, `--screenshot`, `--after`)
 reach the `serve` hook as `run.env` (`LABELLE_SCENE`, ...). A browser game

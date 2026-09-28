@@ -305,7 +305,8 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
     assert len(out) == 1, result.stdout
     cap = json.loads(out[0])
     assert cap["id"] == "wasm" and cap["required"] is True and cap["ok"] is True, cap
-    assert [i["id"] for i in cap["items"]] == ["python", "emsdk"], cap
+    assert [i["id"] for i in cap["items"]] == ["python", "emsdk", "git"], cap
+    assert cap["items"][2]["ok"] and "not needed" in cap["items"][2]["detail"], cap  # installed: no clone ahead
     for item in cap["items"]:
         assert set(item) == {"id", "name", "ok", "fixable", "size_mb", "action", "detail", "hint"}, item
     assert cap["items"][0]["action"] == "labelle install python"
