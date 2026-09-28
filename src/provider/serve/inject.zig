@@ -88,37 +88,53 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
 }
 
 /// Splice `script` right after the leading `<!doctype ...>`, else at the
-/// very start. Per the HTML parsing spec, a `<script>` ahead of `<html>`
-/// becomes the first child of `<head>` (the parser creates `<html>` and
-/// `<head>` for it), so it runs before every page script, whatever the
-/// page's markup (no `<head>`, early scripts, templates, SVG, ...). After
-/// the doctype, not ahead of it, which would put the page in quirks mode.
+/// start (just past a leading byte-order mark). Per the HTML parsing spec, a
+/// `<script>` ahead of `<html>` becomes the first child of `<head>` (the
+/// parser creates `<html>` and `<head>` for it), so it runs before every
+/// page script, whatever the page's markup (no `<head>`, early scripts,
+/// templates, SVG, ...). After the doctype, not ahead of it, which would put
+/// the page in quirks mode.
 pub fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
-    const pos = doctypeEnd(html);
+    const pos = injectPoint(html).at;
     return std.mem.concat(allocator, u8, &.{ html[0..pos], script, html[pos..] });
 }
 
-/// The index just past the leading `<!doctype ...>` (case-insensitive),
-/// skipping only byte-order marks, whitespace and `<!-- ... -->` comments
-/// ahead of it; else 0. The doctype ends at its first `>`, as the HTML
-/// tokenizer ends it.
-fn doctypeEnd(html: []const u8) usize {
+const InjectPoint = struct {
+    at: usize,
+    /// Which rule placed it: just past the doctype, or at the start.
+    after: enum { doctype, start },
+};
+
+/// Where the run.env block goes. Two leading prefixes are skipped first, as
+/// fixed prefixes, not by parsing HTML: a UTF-8 byte-order mark (the decoder
+/// strips it only at byte 0, so nothing may go ahead of it; #7) and one
+/// `<?...>`, such as an XML declaration (a bogus comment to HTML, which its
+/// first `>` ends; #7). Then the index just past the `<!doctype ...>`
+/// (case-insensitive), skipping only byte-order marks, whitespace and
+/// `<!-- ... -->` comments ahead of it; the doctype ends at its first `>`,
+/// as the HTML tokenizer ends it. With no such doctype, the start: just past
+/// the byte-order mark, else 0.
+fn injectPoint(html: []const u8) InjectPoint {
     const bom = "\xEF\xBB\xBF";
-    var i: usize = 0;
+    const start: InjectPoint = .{ .at = if (std.mem.startsWith(u8, html, bom)) bom.len else 0, .after = .start };
+    var i: usize = start.at;
+    if (std.mem.startsWith(u8, html[i..], "<?")) {
+        i = (std.mem.indexOfScalarPos(u8, html, i, '>') orelse return start) + 1;
+    }
     while (i < html.len) {
         if (std.mem.startsWith(u8, html[i..], bom)) {
             i += bom.len;
         } else if (std.ascii.isWhitespace(html[i])) {
             i += 1;
         } else if (std.mem.startsWith(u8, html[i..], "<!--")) {
-            const close = std.mem.indexOfPos(u8, html, i + 4, "-->") orelse return 0;
+            const close = std.mem.indexOfPos(u8, html, i + 4, "-->") orelse return start;
             i = close + 3;
         } else break;
     }
     const rest = html[i..];
-    if (rest.len < "<!doctype".len or !std.ascii.eqlIgnoreCase(rest[0.."<!doctype".len], "<!doctype")) return 0;
-    const gt = std.mem.indexOfScalarPos(u8, html, i, '>') orelse return 0;
-    return gt + 1;
+    if (rest.len < "<!doctype".len or !std.ascii.eqlIgnoreCase(rest[0.."<!doctype".len], "<!doctype")) return start;
+    const gt = std.mem.indexOfScalarPos(u8, html, i, '>') orelse return start;
+    return .{ .at = gt + 1, .after = .doctype };
 }
 
 /// The reload client for `generation`, before `</body>`.
@@ -186,10 +202,38 @@ test "injectFirst: right after the leading doctype, else at the start" {
         .{ "<!-- unterminated <!doctype html>", "S<!-- unterminated <!doctype html>" },
         .{ "<!doctype html", "S<!doctype html" },
         .{ "", "S" },
+        // A leading BOM with no doctype: just past the BOM, never ahead of it (#7).
+        .{ "\xEF\xBB\xBF<title>t</title><p>x</p>", "\xEF\xBB\xBFS<title>t</title><p>x</p>" },
+        .{ "\xEF\xBB\xBF", "\xEF\xBB\xBFS" },
+        .{ "\xEF\xBB\xBF<!-- unterminated <!doctype html>", "\xEF\xBB\xBFS<!-- unterminated <!doctype html>" },
+        // A leading XML declaration is skipped on the way to the doctype (#7)...
+        .{ "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html><html>", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>S<html>" },
+        .{ "\xEF\xBB\xBF<?xml version=\"1.0\"?><!-- c --><!doctype html><p>x</p>", "\xEF\xBB\xBF<?xml version=\"1.0\"?><!-- c --><!doctype html>S<p>x</p>" },
+        // ...but with no doctype after it, the block goes at the start.
+        .{ "<?xml version=\"1.0\"?><html>", "S<?xml version=\"1.0\"?><html>" },
+        .{ "\xEF\xBB\xBF<?xml version=\"1.0\"?><html>", "\xEF\xBB\xBFS<?xml version=\"1.0\"?><html>" },
+        .{ "<?xml unterminated <!doctype html>", "S<?xml unterminated <!doctype html>" },
+        // Only one `<?...>`, and only as the very first thing (after a BOM).
+        .{ "<?a?><?b?><!doctype html>", "S<?a?><?b?><!doctype html>" },
+        .{ " <?xml version=\"1.0\"?><!doctype html>", "S <?xml version=\"1.0\"?><!doctype html>" },
     }) |case| {
         const got = try injectFirst(alloc, case[0], "S");
         defer alloc.free(got);
         try std.testing.expectEqualStrings(case[1], got);
     }
     try std.testing.expectEqual(@as(?[]u8, null), try runEnvScript(alloc, &.{}));
+}
+
+test "injectPoint: which rule placed the block" {
+    const cases = [_]struct { html: []const u8, want: InjectPoint }{
+        .{ .html = "<!doctype html><p>", .want = .{ .at = 15, .after = .doctype } },
+        .{ .html = "\xEF\xBB\xBF<!doctype html>", .want = .{ .at = 18, .after = .doctype } },
+        .{ .html = "<?xml?><!doctype html>", .want = .{ .at = 22, .after = .doctype } },
+        .{ .html = "\xEF\xBB\xBF<?xml?>\n<!doctype html>", .want = .{ .at = 26, .after = .doctype } },
+        .{ .html = "\xEF\xBB\xBF<p>x</p>", .want = .{ .at = 3, .after = .start } },
+        .{ .html = "\xEF\xBB\xBF<?xml?><p>x</p>", .want = .{ .at = 3, .after = .start } },
+        .{ .html = "<?xml?><p>x</p>", .want = .{ .at = 0, .after = .start } },
+        .{ .html = "<p>x</p>", .want = .{ .at = 0, .after = .start } },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.want, injectPoint(case.html));
 }

@@ -275,6 +275,38 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           assert.deepEqual(errors, []);
         } finally { await page.close(); await served.stop(); }
       });
+      // #7: the two leading prefixes the injection skips. With a BOM and no
+      // doctype, a block ahead of the BOM would turn it into text that closes
+      // the implied <head> (the <title> would land in <body>); with an XML
+      // declaration, a block ahead of the doctype would put the page in
+      // quirks mode.
+      const early = '<title>t</title><script>window.early = window.LABELLE_RUN_ENV && window.LABELLE_RUN_ENV.LABELLE_SCENE;</script><p>page</p>';
+      for (const [label, before, after, mode] of [
+        ['BOM, no doctype', '﻿', early, 'BackCompat'],
+        ['XML declaration, doctype', '<?xml version="1.0" encoding="UTF-8"?>\n<!doctype html>', early, 'CSS1Compat'],
+      ]) await t.test('serve: run.env with ' + label, async () => {
+        const served = await serveWithRunEnv(join(dir, 'run-env-' + label.replace(/\W+/g, '-')), before + after);
+        const page = await browser.newPage();
+        try {
+          // Exact bytes: the page's own, with the block spliced in between.
+          const body = Buffer.from(await (await fetch(served.url)).arrayBuffer());
+          const head = Buffer.from(before), tail = Buffer.from(after);
+          const block = body.subarray(head.length, body.length - tail.length).toString();
+          assert.ok(body.subarray(0, head.length).equals(head));
+          assert.ok(body.subarray(body.length - tail.length).equals(tail));
+          assert.match(block, /^<script>\nwindow\.LABELLE_RUN_ENV = \{"LABELLE_SCENE":"intro"\};\n[^<]*<\/script>\n$/);
+          const errors = [];
+          page.on('pageerror', e => errors.push(e.message));
+          await page.goto(served.url);
+          const seen = await page.evaluate(() => ({
+            early: window.early, mode: document.compatMode,
+            first: !!document.head.firstElementChild && document.head.firstElementChild.textContent.includes('LABELLE_RUN_ENV'),
+            title: !!document.head.querySelector('title'), bodyText: document.body.textContent,
+          }));
+          assert.deepEqual(seen, { early: 'intro', mode, first: true, title: true, bodyText: 'page' });
+          assert.deepEqual(errors, []);
+        } finally { await page.close(); await served.stop(); }
+      });
       if (realDir) await t.test('actual emcc glue reaches main', async () => {
         const { page, errors } = await pageFor('real');
         try {
