@@ -716,12 +716,15 @@ fn findTag(html: []const u8, name: []const u8) ?Tag {
 /// skips `<!-- ... -->` comments, `<!doctype>`-like and `<?...>`
 /// declarations, end tags, the content of raw-text elements (`<script>`,
 /// `<style>`, `<textarea>`, `<title>`, ...) up to their closing tag, and
-/// quoted attribute values (which may contain `<` and `>`). Anything
-/// unterminated (a comment, a tag, a raw-text element) hides the rest of
-/// the page.
+/// quoted attribute values (which may contain `<` and `>`), and never
+/// yields a tag inside `<template>` content, nested or not. Anything
+/// unterminated (a comment, a tag, a raw-text element, a template) hides
+/// the rest of the page.
 const StartTags = struct {
     html: []const u8,
     i: usize = 0,
+    /// Open `<template>` levels: nothing inside one is yielded.
+    template_depth: usize = 0,
 
     const raw_text = [_][]const u8{ "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes" };
 
@@ -737,8 +740,11 @@ const StartTags = struct {
                 continue;
             }
             if (rest.len > 1 and (rest[1] == '!' or rest[1] == '?' or rest[1] == '/')) {
-                // Declarations and end tags: skip to their `>`.
+                // Declarations and end tags: skip to their `>`. A
+                // `</template>` closes one level of template content.
                 const gt = std.mem.indexOfScalarPos(u8, html, lt + 1, '>') orelse return self.stop();
+                if (rest[1] == '/' and self.template_depth > 0 and std.ascii.eqlIgnoreCase(tagName(html, lt + 2), "template"))
+                    self.template_depth -= 1;
                 self.i = gt + 1;
                 continue;
             }
@@ -746,18 +752,30 @@ const StartTags = struct {
                 self.i = lt + 1; // a bare `<` in text
                 continue;
             }
-            var j = lt + 1;
-            while (j < html.len and !std.ascii.isWhitespace(html[j]) and html[j] != '/' and html[j] != '>') j += 1;
-            const name = html[lt + 1 .. j];
-            const end = attributesEnd(html, j) orelse return self.stop();
+            const name = tagName(html, lt + 1);
+            const end = attributesEnd(html, lt + 1 + name.len) orelse return self.stop();
             self.i = end;
             for (raw_text) |raw| if (std.ascii.eqlIgnoreCase(name, raw)) {
                 self.i = closingTag(html, end, raw) orelse html.len;
                 break;
             };
+            // Template content is inert, however deeply nested: count the
+            // levels and yield nothing inside them.
+            if (std.ascii.eqlIgnoreCase(name, "template")) {
+                self.template_depth += 1;
+                continue;
+            }
+            if (self.template_depth > 0) continue;
             return .{ .name = name, .start = lt, .end = end };
         }
         return self.stop();
+    }
+
+    /// The tag name starting at `from`: up to whitespace, `/` or `>`.
+    fn tagName(html: []const u8, from: usize) []const u8 {
+        var j = from;
+        while (j < html.len and !std.ascii.isWhitespace(html[j]) and html[j] != '/' and html[j] != '>') j += 1;
+        return html[from..j];
     }
 
     fn stop(self: *StartTags) ?Found {
@@ -1242,6 +1260,11 @@ test "injectFirst: after <head>, else <body>, else at the start; never inside <h
         .{ "<html><textarea><body></TEXTAREA ><body>b", "<html><textarea><body></TEXTAREA ><body>Sb" },
         .{ "<!doctype html><script>var s=\"<body>\";</script>", "<!doctype html>S<script>var s=\"<body>\";</script>" },
         .{ "<!doctype html><style><body>", "<!doctype html>S<style><body>" },
+        // Template content is inert, however nested; unterminated, it hides the rest.
+        .{ "<!doctype html><html><template><script>t</script></template><body><script>b</script></body>", "<!doctype html><html><template><script>t</script></template><body>S<script>b</script></body>" },
+        .{ "<html><template><template><p/></template><script>t</script><body></template><script>a</script>", "<html><template><template><p/></template><script>t</script><body></template>S<script>a</script>" },
+        .{ "<html><TEMPLATE x=\"</template>\"><style></template></style><script>t</script></Template ><script>a</script>", "<html><TEMPLATE x=\"</template>\"><style></template></style><script>t</script></Template >S<script>a</script>" },
+        .{ "<!DOCTYPE html><template><template></template><script>t</script><body>b", "<!DOCTYPE html>S<template><template></template><script>t</script><body>b" },
         // A script ahead of a late <head> runs before it: go first.
         .{ "<script>a</script><head><title>t</title></head>", "S<script>a</script><head><title>t</title></head>" },
         .{ "<html><head><script>a</script></head><script>b</script>", "<html><head>S<script>a</script></head><script>b</script>" },
