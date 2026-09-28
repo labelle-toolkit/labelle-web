@@ -131,11 +131,19 @@ jobs:
         working-directory: tests/shell
 
   provider:
-    name: Provider commands and hooks (real CLI 2.1.0, ${{ matrix.os }})
+    name: Provider commands and hooks (real CLI ${{ matrix.cli.version }}, ${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Both CLI majors in the field: 2.1.x still speaks this provider's
+        # command contract (>=1.3.0 <1.6.0), and 3.0.0 is the current release.
+        # e2e.py branches on `labelle --version` (the 3.x core has no `wasm`).
+        cli:
+          - version: 2.1.0
+            ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
+          - version: 3.0.0
+            ref: 0fc952fa475707884f2f85863be7b78686de523b
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -149,14 +157,11 @@ jobs:
         id: py
         with:
           python-version: '3.12'
-      # labelle-cli v2.1.0: provider contract 1.3.0 (cache_dir, env_file,
-      # target_defaults, run.watch).
-      # TODO(#14): move this pin to the labelle-cli v3.0.0 tag once it exists;
-      # e2e.py already branches on `labelle --version` for 3.x.
+      # The labelle-cli release under test, pinned to its tag's commit.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
+          ref: ${{ matrix.cli.ref }}
           path: .test-cli
           persist-credentials: false
       - run: zig build
@@ -203,11 +208,12 @@ jobs:
         id: py
         with:
           python-version: '3.12'
-      # TODO(#14): move this pin to the labelle-cli v3.0.0 tag once it exists.
+      # labelle-cli v3.0.0 (the current release) only: this job downloads
+      # ~1 GB per run, so the 2.1.x coverage lives in the provider job.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
+          ref: 0fc952fa475707884f2f85863be7b78686de523b
           path: .test-cli
           persist-credentials: false
       - run: zig build

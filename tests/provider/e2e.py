@@ -60,8 +60,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         for verb in ('serve', 'export'):
             run('wasm', verb, '--no-build', fail="unknown command 'wasm'")
     else:
-        # TODO(#14): drop this 2.x branch once CI's CLI pin moves to 3.0.0.
-        # Old export shares the CLI run phase: it must refuse a server replacement.
+        # CLI 2.1.x (still in CI's matrix, #14): old export shares the CLI
+        # run phase, so it must refuse a server replacement.
         for verb in ('serve', 'export'):
             run('wasm', verb, '--no-build', fail='legacy `wasm serve/export`')
     run('web', 'export', '--output=dist', '--zip', '--platform=github-pages')
