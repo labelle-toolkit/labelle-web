@@ -495,7 +495,8 @@ pub const default_backend = "bgfx";
 /// `default_backend`. The file is parsed as ZON, the way the CLI reads it,
 /// so any whitespace or comments around the field are fine and only the
 /// top-level `.backend` counts (not one nested in, say, a plugin entry).
-/// An unreadable or malformed file yields the default.
+/// An unreadable or malformed file (an invalid string escape included, as
+/// the CLI's parse rejects it) yields the default.
 pub fn projectBackend(a: std.mem.Allocator, io: std.Io, project_dir: []const u8) ![]const u8 {
     const path = try std.fs.path.join(a, &.{ project_dir, "project.labelle" });
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return default_backend;
@@ -507,7 +508,7 @@ pub fn projectBackend(a: std.mem.Allocator, io: std.Io, project_dir: []const u8)
 fn backendFromZon(a: std.mem.Allocator, source: [:0]const u8) ?[]const u8 {
     const tree = std.zig.Ast.parse(a, source, .zon) catch return null;
     if (tree.errors.len != 0) return null;
-    const zoir = std.zig.ZonGen.generate(a, tree, .{ .parse_str_lits = false }) catch return null;
+    const zoir = std.zig.ZonGen.generate(a, tree, .{}) catch return null;
     if (zoir.hasCompileErrors()) return null;
     const fields = switch (std.zig.Zoir.Node.Index.root.get(zoir)) {
         .struct_literal => |s| s,
@@ -559,6 +560,7 @@ test "projectBackend tolerates tabs, line breaks and comments around the field" 
         .{ ".{ .plugins = .{ .{ .name = \"x\", .backend = .raylib } }, .name = \"demo\" }", default_backend },
         .{ ".{ .plugins = .{ .{ .backend = .raylib } }, .backend = .sokol }", "sokol" },
         .{ ".{ .backend = \"raylib\" }", default_backend },
+        .{ ".{ .name = \"bad\\q\", .backend = .sokol }", default_backend },
     }) |case| {
         try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = case[0] });
         try testing.expectEqualStrings(case[1], try projectBackend(a, testing.io, project));

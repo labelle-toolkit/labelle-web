@@ -674,7 +674,8 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
 /// synchronous script ahead of `<body>` still sees the options before it
 /// runs. With none of them, it goes after the `<!doctype ...>` (never ahead
 /// of it, which would put the page in quirks mode), else at the start. The
-/// tags are found by `findTag`, which skips comments.
+/// tags are found by `findTag`, a small tokenizer that skips comments,
+/// raw-text element content and attribute values.
 fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
     var at: ?usize = null;
     if (findTag(html, "head")) |t| at = t.end;
@@ -699,40 +700,102 @@ fn tagEnd(html: []const u8, name: []const u8) ?usize {
     return if (findTag(html, name)) |t| t.end else null;
 }
 
+const Tag = struct { start: usize, end: usize };
+
 /// The first real `<name ...>` start tag: `start` at its `<`, `end` just
-/// past its `>`. A small scan over the markup that skips `<!-- ... -->`
-/// comments (an unterminated one hides the rest of the page), matches the
-/// name case-insensitively and whole (`<header>` is not `<head>`), and
-/// allows attributes. Quoted attribute values may contain `>`.
-fn findTag(html: []const u8, name: []const u8) ?struct { start: usize, end: usize } {
-    var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
-        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
-            const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return null;
-            i = close + 3;
-            continue;
-        }
-        const start = lt + 1;
-        const end = start + name.len;
-        if (end <= html.len and std.ascii.eqlIgnoreCase(html[start..end], name) and
-            (end == html.len or html[end] == '>' or html[end] == '/' or std.ascii.isWhitespace(html[end])))
-        {
-            var quote: ?u8 = null;
-            var j = end;
-            while (j < html.len) : (j += 1) {
-                const c = html[j];
-                if (quote) |q| {
-                    if (c == q) quote = null;
-                } else if (c == '"' or c == '\'') {
-                    quote = c;
-                } else if (c == '>') return .{ .start = lt, .end = j + 1 };
-            }
-            return null;
-        }
-        i = start;
-    }
+/// past its `>`. Found by `StartTags`, so text inside comments, raw-text
+/// elements and attribute values never matches, and the name matches
+/// case-insensitively and whole (`<header>` is not `<head>`).
+fn findTag(html: []const u8, name: []const u8) ?Tag {
+    var tags: StartTags = .{ .html = html };
+    while (tags.next()) |t| if (std.ascii.eqlIgnoreCase(t.name, name)) return .{ .start = t.start, .end = t.end };
     return null;
 }
+
+/// A small HTML tokenizer that yields start tags in document order. It
+/// skips `<!-- ... -->` comments, `<!doctype>`-like and `<?...>`
+/// declarations, end tags, the content of raw-text elements (`<script>`,
+/// `<style>`, `<textarea>`, `<title>`, ...) up to their closing tag, and
+/// quoted attribute values (which may contain `<` and `>`). Anything
+/// unterminated (a comment, a tag, a raw-text element) hides the rest of
+/// the page.
+const StartTags = struct {
+    html: []const u8,
+    i: usize = 0,
+
+    const raw_text = [_][]const u8{ "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes" };
+
+    const Found = struct { name: []const u8, start: usize, end: usize };
+
+    fn next(self: *StartTags) ?Found {
+        const html = self.html;
+        while (std.mem.indexOfScalarPos(u8, html, self.i, '<')) |lt| {
+            const rest = html[lt..];
+            if (std.mem.startsWith(u8, rest, "<!--")) {
+                const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return self.stop();
+                self.i = close + 3;
+                continue;
+            }
+            if (rest.len > 1 and (rest[1] == '!' or rest[1] == '?' or rest[1] == '/')) {
+                // Declarations and end tags: skip to their `>`.
+                const gt = std.mem.indexOfScalarPos(u8, html, lt + 1, '>') orelse return self.stop();
+                self.i = gt + 1;
+                continue;
+            }
+            if (rest.len < 2 or !std.ascii.isAlphabetic(rest[1])) {
+                self.i = lt + 1; // a bare `<` in text
+                continue;
+            }
+            var j = lt + 1;
+            while (j < html.len and !std.ascii.isWhitespace(html[j]) and html[j] != '/' and html[j] != '>') j += 1;
+            const name = html[lt + 1 .. j];
+            const end = attributesEnd(html, j) orelse return self.stop();
+            self.i = end;
+            for (raw_text) |raw| if (std.ascii.eqlIgnoreCase(name, raw)) {
+                self.i = closingTag(html, end, raw) orelse html.len;
+                break;
+            };
+            return .{ .name = name, .start = lt, .end = end };
+        }
+        return self.stop();
+    }
+
+    fn stop(self: *StartTags) ?Found {
+        self.i = self.html.len;
+        return null;
+    }
+
+    /// Past the `>` closing a start tag whose name ends at `from`: quoted
+    /// values (after `=`) are skipped whole.
+    fn attributesEnd(html: []const u8, from: usize) ?usize {
+        var j = from;
+        while (j < html.len) : (j += 1) switch (html[j]) {
+            '>' => return j + 1,
+            '=' => {
+                j += 1;
+                while (j < html.len and std.ascii.isWhitespace(html[j])) j += 1;
+                if (j < html.len and (html[j] == '"' or html[j] == '\'')) {
+                    j = std.mem.indexOfScalarPos(u8, html, j + 1, html[j]) orelse return null;
+                } else j -= 1;
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    /// The index of `</name` (any case, then whitespace, `/` or `>`) at or
+    /// after `from`: where a raw-text element's content ends.
+    fn closingTag(html: []const u8, from: usize, name: []const u8) ?usize {
+        var k = from;
+        while (std.mem.indexOfPos(u8, html, k, "</")) |at| {
+            const e = at + 2 + name.len;
+            if (e <= html.len and std.ascii.eqlIgnoreCase(html[at + 2 .. e], name) and
+                (e == html.len or html[e] == '>' or html[e] == '/' or std.ascii.isWhitespace(html[e]))) return at;
+            k = at + 2;
+        }
+        return null;
+    }
+};
 
 /// The reload client for `generation`, before `</body>`.
 fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8, generation: u64) ![]u8 {
@@ -1172,6 +1235,13 @@ test "injectFirst: after <head>, else <body>, else at the start; never inside <h
         // Neither head, script nor body: after the doctype, never ahead of it.
         .{ "<!DOCTYPE html>\n<p>x</p>", "<!DOCTYPE html>S\n<p>x</p>" },
         .{ "  <!doctype html><p>x</p>", "  <!doctype html>S<p>x</p>" },
+        // Tag-like text in raw-text content or attribute values is not a tag.
+        .{ "<html><style>x::after{content:\"<script>\"}</style><body><p>x</p></body></html>", "<html><style>x::after{content:\"<script>\"}</style><body>S<p>x</p></body></html>" },
+        .{ "<html><head data-x=\"<script>\"><script>a</script></head></html>", "<html><head data-x=\"<script>\">S<script>a</script></head></html>" },
+        .{ "<html><p title='<body>'>x</p><title><script></title><script>a</script>", "<html><p title='<body>'>x</p><title><script></title>S<script>a</script>" },
+        .{ "<html><textarea><body></TEXTAREA ><body>b", "<html><textarea><body></TEXTAREA ><body>Sb" },
+        .{ "<!doctype html><script>var s=\"<body>\";</script>", "<!doctype html>S<script>var s=\"<body>\";</script>" },
+        .{ "<!doctype html><style><body>", "<!doctype html>S<style><body>" },
         // A script ahead of a late <head> runs before it: go first.
         .{ "<script>a</script><head><title>t</title></head>", "S<script>a</script><head><title>t</title></head>" },
         .{ "<html><head><script>a</script></head><script>b</script>", "<html><head>S<script>a</script></head><script>b</script>" },
