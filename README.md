@@ -161,9 +161,13 @@ The manifest's `target_defaults` makes `wasm` builds ReleaseSafe unless
 The `toolchain` hook runs before generation, so its contribution reaches the
 CLI's generation-time fingerprint pass (`zig build --list-steps`), the compile
 and every later hook. It writes `env_file` with `EMSDK`, `EM_CONFIG` (when the
-emsdk has one) and `upstream/emscripten` in front of `PATH`. The backends
-(bgfx, sokol, raylib) link with `$EMSDK/upstream/emscripten/emcc` whenever
-it exists, so every backend shares one emsdk.
+emsdk has one), and `upstream/emscripten` then `upstream/bin` in front of
+`PATH`, whichever source the emsdk comes from. `upstream/bin` carries
+binaryen's `wasm-opt`, which the bundle export runs; a `labelle web export`
+command, which gets no contribution, falls back to the `wasm-opt` in
+`$EMSDK`, `emsdk.root` or the managed install when `PATH` has none. The
+backends (bgfx, sokol, raylib) link with `$EMSDK/upstream/emscripten/emcc`
+whenever it exists, so every backend shares one emsdk.
 
 Which emsdk, by settings `emsdk.source`:
 

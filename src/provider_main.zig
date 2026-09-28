@@ -34,6 +34,8 @@ const Options = struct {
     run_env: []const server.RunEnv = &.{},
     /// `run.timeout_ms` (`labelle run --timeout`): stop serving then, exit 0.
     timeout_ms: ?u64 = null,
+    /// Export: the emsdk's `wasm-opt`, for when PATH has none.
+    wasm_opt: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -116,12 +118,16 @@ fn execute(init: std.process.Init) !void {
             if (run.watch) |session| return serveSession(init, settings, opts, .{ .generation_file = session.generation_file, .output_dir = session.output_dir });
             return webAction(init, ctx, settings, opts, .serve);
         }
-        if (is(id, "export") and step == .bundle and phase == .replace) return webAction(init, ctx, settings, .{}, .@"export");
+        if (is(id, "export") and step == .bundle and phase == .replace) return webAction(init, ctx, settings, .{ .wasm_opt = emsdk.wasmOptPath(a, io, inputs) }, .@"export");
         return error.InvalidInvocation;
     }
 
     if (is(id, "serve")) return webAction(init, ctx, settings, try parseOptions(argv.items, .serve), .serve);
-    if (is(id, "export")) return webAction(init, ctx, settings, try parseOptions(argv.items, .@"export"), .@"export");
+    if (is(id, "export")) {
+        var opts = try parseOptions(argv.items, .@"export");
+        opts.wasm_opt = emsdk.wasmOptPath(a, io, inputs);
+        return webAction(init, ctx, settings, opts, .@"export");
+    }
     if (is(id, "doctor")) {
         var json = false;
         for (argv.items) |arg| {
@@ -309,6 +315,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
                 .output_dir = out,
                 .zip = opts.zip or settings.@"export".zip,
                 .platform = opts.platform orelse try settings.exportPlatform(),
+                .wasm_opt_fallback = opts.wasm_opt,
             });
         },
         .stage, .serve => {

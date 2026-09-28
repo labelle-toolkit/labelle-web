@@ -408,6 +408,21 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
         run('web', 'export', '--output=optimizer-failed')
         assert (project / 'optimizer-failed/game.wasm.opt').read_bytes() == b'legitimate asset'
         assert not list(project.glob('*.wasm-opt-*')), 'optimizer scratch directories leaked'
+        # A command gets no toolchain contribution: with no wasm-opt on PATH,
+        # the one in EMSDK's upstream/bin (binaryen) is used.
+        sdk_bin = temp / 'emsdk/upstream/bin'
+        sdk_bin.mkdir(parents=True)
+        (sdk_bin / 'wasm-opt').write_text(optimizer.read_text().replace('\nraise SystemExit(1)\n', '\n'))
+        (sdk_bin / 'wasm-opt').chmod(0o755)
+        env['PATH'] = os.pathsep.join(p for p in os.environ['PATH'].split(os.pathsep) if p and not (Path(p) / 'wasm-opt').exists())
+        env['EMSDK'] = str(temp / 'emsdk')
+        (web / 'game.wasm').write_bytes(wasm + b'\0\1\0')
+        result = run('web', 'export', '--output=emsdk-optimized')
+        assert 'wasm-opt not found' not in result.stderr, result.stderr
+        assert len((project / 'emsdk-optimized/game.wasm').read_bytes()) == 8
+        env.pop('EMSDK')
+        if 'EMSDK' in os.environ:
+            env['EMSDK'] = os.environ['EMSDK']
         (web / 'game.wasm').write_bytes(wasm)
         env['PATH'] = os.environ['PATH']
     # Serve through the actual CLI, including final stamped page and custom JS.
