@@ -482,7 +482,8 @@ fn handleConnection(
     };
     defer allocator.free(body);
 
-    // Served HTML gets the `labelle run` options first in <head> and, in a
+    // Served HTML gets the `labelle run` options right after its doctype
+    // (so first in <head>, per the HTML parser) and, in a
     // watch session, the reload client seeded with its generation. Other
     // assets pass through untouched.
     const is_html = std.mem.startsWith(u8, content_type, "text/html");
@@ -615,7 +616,8 @@ fn reloadClient(allocator: std.mem.Allocator, generation: u64) ![]u8 {
 }
 
 /// The `labelle run` options (`run.env`: `LABELLE_SCENE`, `LABELLE_PROFILE`,
-/// ...) for a page, as a script placed first in `<head>`: it publishes them
+/// ...) for a page, as a script placed right after the doctype, which the
+/// HTML parser makes the first child of `<head>`: it publishes them
 /// as `window.LABELLE_RUN_ENV` and adds a `Module.preRun` step copying them
 /// into Emscripten's `ENV`, so the game's `getenv` (the engine's
 /// `requestedScene()` reads `LABELLE_SCENE`) sees them as on desktop. The
@@ -668,47 +670,38 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
     return std.mem.concat(allocator, u8, &.{ html, script });
 }
 
-/// Splice `script` right after the opening `<head ...>` tag, ahead of every
-/// page script; else after `<body ...>`; else at the start. The tags are
-/// found by `tagEnd`, which skips comments.
+/// Splice `script` right after the leading `<!doctype ...>`, else at the
+/// very start. Per the HTML parsing spec, a `<script>` ahead of `<html>`
+/// becomes the first child of `<head>` (the parser creates `<html>` and
+/// `<head>` for it), so it runs before every page script, whatever the
+/// page's markup (no `<head>`, early scripts, templates, SVG, ...). After
+/// the doctype, not ahead of it, which would put the page in quirks mode.
 fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
-    const at = tagEnd(html, "head") orelse tagEnd(html, "body") orelse 0;
-    return std.mem.concat(allocator, u8, &.{ html[0..at], script, html[at..] });
+    const pos = doctypeEnd(html);
+    return std.mem.concat(allocator, u8, &.{ html[0..pos], script, html[pos..] });
 }
 
-/// The index just past the `>` of the first real `<name ...>` start tag:
-/// a small scan over the markup that skips `<!-- ... -->` comments (an
-/// unterminated one hides the rest of the page), matches the name
-/// case-insensitively and whole (`<header>` is not `<head>`), and allows
-/// attributes. Quoted attribute values may contain `>`.
-fn tagEnd(html: []const u8, name: []const u8) ?usize {
+/// The index just past the leading `<!doctype ...>` (case-insensitive),
+/// skipping only byte-order marks, whitespace and `<!-- ... -->` comments
+/// ahead of it; else 0. The doctype ends at its first `>`, as the HTML
+/// tokenizer ends it.
+fn doctypeEnd(html: []const u8) usize {
+    const bom = "\xEF\xBB\xBF";
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
-        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
-            const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return null;
+    while (i < html.len) {
+        if (std.mem.startsWith(u8, html[i..], bom)) {
+            i += bom.len;
+        } else if (std.ascii.isWhitespace(html[i])) {
+            i += 1;
+        } else if (std.mem.startsWith(u8, html[i..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, html, i + 4, "-->") orelse return 0;
             i = close + 3;
-            continue;
-        }
-        const start = lt + 1;
-        const end = start + name.len;
-        if (end <= html.len and std.ascii.eqlIgnoreCase(html[start..end], name) and
-            (end == html.len or html[end] == '>' or html[end] == '/' or std.ascii.isWhitespace(html[end])))
-        {
-            var quote: ?u8 = null;
-            var j = end;
-            while (j < html.len) : (j += 1) {
-                const c = html[j];
-                if (quote) |q| {
-                    if (c == q) quote = null;
-                } else if (c == '"' or c == '\'') {
-                    quote = c;
-                } else if (c == '>') return j + 1;
-            }
-            return null;
-        }
-        i = start;
+        } else break;
     }
-    return null;
+    const rest = html[i..];
+    if (rest.len < "<!doctype".len or !std.ascii.eqlIgnoreCase(rest[0.."<!doctype".len], "<!doctype")) return 0;
+    const gt = std.mem.indexOfScalarPos(u8, html, i, '>') orelse return 0;
+    return gt + 1;
 }
 
 /// The reload client for `generation`, before `</body>`.
@@ -1078,7 +1071,7 @@ test "handleConnection: a watch session seeds the reload client with the served 
     try std.testing.expect(std.mem.indexOf(u8, page, "if (v !== current) { location.reload(); return; }") != null);
 }
 
-test "handleConnection: run options reach the page first in <head>; the endpoint stays a file outside watch" {
+test "handleConnection: run options reach the page right after the doctype; the endpoint stays a file outside watch" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1097,7 +1090,8 @@ test "handleConnection: run options reach the page first in <head>; the endpoint
     const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
     defer alloc.free(page);
     const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro\\u003c/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
-    try std.testing.expect(env_at > std.mem.indexOf(u8, page, "<HEAD lang=en>").?);
+    try std.testing.expect(std.mem.startsWith(u8, page[std.mem.indexOf(u8, page, "<!doctype html>").? + "<!doctype html>".len ..], "<script>"));
+    try std.testing.expect(env_at < std.mem.indexOf(u8, page, "<html>").?);
     try std.testing.expect(env_at < std.mem.indexOf(u8, page, "var Module={}").?);
     try std.testing.expect(std.mem.indexOf(u8, page, "location.reload") == null);
     const asset = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
@@ -1120,27 +1114,25 @@ test "runEnvScript: no `<` reaches the script element, whatever its case" {
     try std.testing.expectEqualStrings("a</ScRiPt><!--b", parsed.value.object.get("LABELLE_SCENE").?.string);
 }
 
-test "tagEnd skips comments, matches whole names in any case, allows attributes" {
-    const html = "<!doctype html><!-- <head> old --><HTML><header x=1></header><Head data-x=\"a>b\">T</head>";
-    const at = tagEnd(html, "head").?;
-    try std.testing.expectEqualStrings("T</head>", html[at..]);
-    try std.testing.expectEqual(@as(?usize, null), tagEnd("<!-- <head> -->", "head"));
-    try std.testing.expectEqual(@as(?usize, null), tagEnd("<p><!-- unterminated <head>", "head"));
-    const alloc = std.testing.allocator;
-    const got = try injectFirst(alloc, "<!-- <head> --><html><head><title>t</title></head></html>", "S");
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings("<!-- <head> --><html><head>S<title>t</title></head></html>", got);
-    const bare = try injectFirst(alloc, "<!-- <head> --><p>x</p>", "S");
-    defer alloc.free(bare);
-    try std.testing.expectEqualStrings("S<!-- <head> --><p>x</p>", bare);
-}
-
-test "injectFirst: after <head>, else <body>, else at the start; never inside <header>" {
+test "injectFirst: right after the leading doctype, else at the start" {
     const alloc = std.testing.allocator;
     for ([_][2][]const u8{
-        .{ "<html><head><title>t</title></head></html>", "<html><head>S<title>t</title></head></html>" },
-        .{ "<html><body class=x><header>h</header></body></html>", "<html><body class=x>S<header>h</header></body></html>" },
+        // Doctype + head: ahead of <html>, so the parser makes it head's first child.
+        .{ "<!doctype html><html><head><script>a</script></head></html>", "<!doctype html>S<html><head><script>a</script></head></html>" },
+        // No head, an early script: the block comes before it.
+        .{ "<!DOCTYPE html><html><script>var Module={};</script><body></body></html>", "<!DOCTYPE html>S<html><script>var Module={};</script><body></body></html>" },
+        // BOM, whitespace and comments ahead of the doctype are skipped.
+        .{ "\xEF\xBB\xBF<!doctype html><p>x</p>", "\xEF\xBB\xBF<!doctype html>S<p>x</p>" },
+        .{ " \r\n\t<!DocType html>\n<p>x</p>", " \r\n\t<!DocType html>S\n<p>x</p>" },
+        .{ "\xEF\xBB\xBF <!-- a <!doctype x> in a comment --> <!-- b --><!doctype html><html>", "\xEF\xBB\xBF <!-- a <!doctype x> in a comment --> <!-- b --><!doctype html>S<html>" },
+        .{ "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><html>", "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\">S<html>" },
+        // No doctype (or not leading): at the start.
+        .{ "<html><head></head></html>", "S<html><head></head></html>" },
         .{ "<p>fragment</p>", "S<p>fragment</p>" },
+        .{ "<p>x</p><!doctype html>", "S<p>x</p><!doctype html>" },
+        .{ "<!-- unterminated <!doctype html>", "S<!-- unterminated <!doctype html>" },
+        .{ "<!doctype html", "S<!doctype html" },
+        .{ "", "S" },
     }) |case| {
         const got = try injectFirst(alloc, case[0], "S");
         defer alloc.free(got);

@@ -99,7 +99,7 @@ jobs:
           source ~/emsdk/emsdk_env.sh
           mkdir -p zig-out/shell-fixture
           emcc -O1 tests/shell/main.c -o zig-out/shell-fixture/game.js
-          zig build install-shell
+          zig build install-shell install-provider
       - run: npm ci --ignore-scripts
         working-directory: tests/shell
       - run: npx playwright install --with-deps chromium
@@ -122,7 +122,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: zig build install-shell
+      - run: zig build install-shell install-provider
       - run: npm ci --ignore-scripts
         working-directory: tests/shell
       - run: npx playwright install --with-deps chromium firefox webkit
