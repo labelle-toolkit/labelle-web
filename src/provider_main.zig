@@ -30,10 +30,13 @@ const Options = struct {
     no_open: bool = false,
     zip: bool = false,
     platform: ?exporter.Platform = null,
+    /// The `run.env` of a `run` hook, for the served page.
+    run_env: []const server.RunEnv = &.{},
 };
 
 pub fn main(init: std.process.Init) !u8 {
     config.io = init.io;
+    emsdk.environ = init.minimal.environ;
     execute(init) catch |err| switch (err) {
         // Already explained on stderr.
         error.RequirementsMissing => return 1,
@@ -66,7 +69,7 @@ fn execute(init: std.process.Init) !void {
     const parsed = try contract.parseContext(a, bytes, true);
     const ctx = parsed.value;
     // The manifest admits exactly 1.3.x: `cache_dir`, `env_file`, `run.watch`.
-    if (!contract.carriesToolchainContext(ctx.contract_version)) return error.UnsupportedContract;
+    if (!wireAccepted(ctx.contract_version)) return error.UnsupportedContract;
     const project = ctx.project_dir.?;
     const settings = if (ctx.config_file) |path|
         try settings_mod.parse(a, try cwd.readFileAlloc(io, path, a, .limited(1024 * 1024)))
@@ -103,7 +106,10 @@ fn execute(init: std.process.Init) !void {
         if (is(id, "shell") and step == .build and phase == .after) return webAction(init, ctx, settings, .{}, .stage);
         if (is(id, "serve") and step == .run and phase == .replace) {
             const run = ctx.run orelse return error.MissingRunContext;
-            const opts = try parseOptions(run.args, .serve);
+            var opts = try parseOptions(run.args, .serve);
+            const page_env = try a.alloc(server.RunEnv, run.env.len);
+            for (run.env, page_env) |from, *to| to.* = .{ .name = from.name, .value = from.value };
+            opts.run_env = page_env;
             if (run.watch) |session| return serveSession(init, settings, opts, .{ .generation_file = session.generation_file, .output_dir = session.output_dir });
             return webAction(init, ctx, settings, opts, .serve);
         }
@@ -128,30 +134,45 @@ fn execute(init: std.process.Init) !void {
     return error.UnknownCommand;
 }
 
+/// The wires `command_contract = ">=1.3.0 <1.4.0"` admits: 1.3.x, stable.
+fn wireAccepted(wire_version: []const u8) bool {
+    const wire = std.SemanticVersion.parse(wire_version) catch return false;
+    return wire.major == 1 and wire.minor == 3 and wire.pre == null and wire.build == null;
+}
+
 fn is(x: []const u8, y: []const u8) bool {
     return std.mem.eql(u8, x, y);
 }
 
 // ── Toolchain hooks and command ─────────────────────────────────────────
 
-fn requirePython(a: std.mem.Allocator, io: std.Io) !void {
-    if (emsdk.findPython(a, io, emsdk.system) == null) {
-        std.debug.print("{s}", .{emsdk.python_missing});
-        return error.PythonMissing;
+/// The verified Python 3 command, or a failure naming the fix.
+fn requirePython(a: std.mem.Allocator, io: std.Io) ![]const u8 {
+    switch (emsdk.checkPython(a, io, emsdk.system)) {
+        .found => |cmd| return cmd,
+        .python2 => |cmd| {
+            std.debug.print(emsdk.python2_found, .{cmd});
+            return error.PythonTooOld;
+        },
+        .missing => {
+            std.debug.print("{s}", .{emsdk.python_missing});
+            return error.PythonMissing;
+        },
     }
 }
 
 /// `before generate`: resolve (and, managed, provision) the emsdk and
 /// contribute it, so the fingerprint pass and the compile both see it.
-fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, in: emsdk.Inputs) !void {
-    try requirePython(a, io);
+fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs) !void {
+    var in = inputs;
+    in.python = try requirePython(a, io);
     const resolved = (try emsdk.ensure(a, io, emsdk.system, in)) orelse {
         std.debug.print("labelle-web: emsdk.source is \"package\": the fetched emsdk is activated after generation\n", .{});
         return;
     };
     const r = resolved.ready;
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ r.source.label(), r.root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root, in.python);
 }
 
 /// `after generate`: package mode only. Activate every fetched
@@ -159,10 +180,10 @@ fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, in: em
 /// onward; the fingerprint pass already ran).
 fn hookToolchainPackage(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, in: emsdk.Inputs) !void {
     if (in.emsdk.source != .package) return;
-    try requirePython(a, io);
-    const root = try emsdk.activatePackages(a, io, emsdk.system, ctx.target_dir.?, in.cache_dir, in.version(), in.offline);
+    const python = try requirePython(a, io);
+    const root = try emsdk.activatePackages(a, io, emsdk.system, ctx.target_dir.?, in.cache_dir, in.version(), in.offline, python);
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ emsdk.Source.package.label(), root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root, python);
 }
 
 /// `labelle web toolchain which|install [<version>]`.
@@ -184,8 +205,8 @@ fn commandToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, in:
     if (is(argv[0], "install") and argv.len <= 2) {
         const version = if (argv.len == 2) argv[1] else in.version();
         if (!settings_mod.safeVersion(version)) return error.InvalidEmsdkVersion;
-        try requirePython(a, io);
-        const dir = try emsdk.ensureManaged(a, io, emsdk.system, in.cache_dir, version, in.offline);
+        const python = try requirePython(a, io);
+        const dir = try emsdk.ensureManaged(a, io, emsdk.system, in.cache_dir, version, in.offline, python);
         try stdio.answer(io, json_progress, "emsdk {s}: {s}\n", .{ version, dir });
         return;
     }
@@ -236,7 +257,7 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try checkRuntime(io, web);
     try exporter.validateBuildTree(io, std.Io.Dir.cwd(), web);
     const port = opts.port orelse settings.port;
-    try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session);
+    try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env);
 }
 
 fn checkRuntime(io: std.Io, web: []const u8) !void {
@@ -292,7 +313,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
                 // Serve the stamped copy, never the original placeholder-bearing source.
-                try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null);
+                try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env);
             }
         },
     }
@@ -358,6 +379,34 @@ test "run.args and command options: serve and export options stay apart" {
     try std.testing.expectError(error.ServeOptionOnExport, parseOptions(&.{"--no-open"}, .@"export"));
     const export_opts = try parseOptions(&.{ "--output=out", "--platform=itch" }, .@"export");
     try std.testing.expectEqual(exporter.Platform.itch, export_opts.platform.?);
+}
+
+test "the tool accepts every 1.3.x wire and nothing else, and still decodes strictly" {
+    for ([_][]const u8{ "1.3.0", "1.3.7" }) |wire| try std.testing.expect(wireAccepted(wire));
+    for ([_][]const u8{ "1.4.0", "1.2.0", "2.3.0", "1.3.1-rc.1", "x" }) |wire| try std.testing.expect(!wireAccepted(wire));
+    const a = std.testing.allocator;
+    const ctx = if (@import("builtin").os.tag == .windows)
+        \\{"contract_version":"VER","invocation":{"kind":"command","id":"doctor","step":null,"phase":null},"package_dir":"C:\\p","project_dir":"C:\\g","target":"wasm","lock_file":"C:\\g\\labelle.lock","config_file":null,"output_dir":"C:\\o","zig_executable":"C:\\z","optimize":"Debug","progress":"off","target_dir":null,"cache_dir":"C:\\c","env_file":null EXTRA}
+    else
+        \\{"contract_version":"VER","invocation":{"kind":"command","id":"doctor","step":null,"phase":null},"package_dir":"/p","project_dir":"/g","target":"wasm","lock_file":"/g/labelle.lock","config_file":null,"output_dir":"/o","zig_executable":"/z","optimize":"Debug","progress":"off","target_dir":null,"cache_dir":"/c","env_file":null EXTRA}
+    ;
+    for ([_][]const u8{ "1.3.0", "1.3.7" }) |wire| {
+        const ok = try std.mem.replaceOwned(u8, a, ctx, "VER", wire);
+        defer a.free(ok);
+        const plain = try std.mem.replaceOwned(u8, a, ok, " EXTRA", "");
+        defer a.free(plain);
+        const parsed = try contract.parseContext(a, plain, true);
+        parsed.deinit();
+        // A patch adds no keys: an unknown field is still refused.
+        const extra = try std.mem.replaceOwned(u8, a, ok, " EXTRA", ",\"new_key\":1");
+        defer a.free(extra);
+        try std.testing.expectError(error.UnknownField, contract.parseContext(a, extra, true));
+    }
+    const newer = try std.mem.replaceOwned(u8, a, ctx, "VER", "1.4.0");
+    defer a.free(newer);
+    const newer_plain = try std.mem.replaceOwned(u8, a, newer, " EXTRA", "");
+    defer a.free(newer_plain);
+    try std.testing.expectError(error.UnsupportedContract, contract.parseContext(a, newer_plain, true));
 }
 
 test {

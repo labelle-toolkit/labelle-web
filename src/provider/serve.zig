@@ -179,12 +179,15 @@ pub fn serveAndOpen(
     port: u16,
     open_browser_tab: bool,
     session: ?watch.Session,
+    run_env: []const RunEnv,
 ) !void {
     const io = config.globalIo();
 
     // The session starts at the generation the CLI published before it
     // launched this replacement (0), read before the first request.
-    var wstate = WatchState{ .session = session };
+    const env_script = try runEnvScript(allocator, run_env);
+    defer if (env_script) |e| allocator.free(e);
+    var wstate = WatchState{ .session = session, .run_env_script = env_script };
     if (session) |s| {
         const initial = (try watch.readGeneration(io, s.generation_file)) orelse return error.MissingWatchGeneration;
         wstate.version.store(initial, .release);
@@ -220,7 +223,7 @@ pub fn serveAndOpen(
         wstate.stop.store(true, .release);
         t.join();
     };
-    const watch_state: ?*WatchState = if (session != null) &wstate else null;
+    const watch_state: ?*WatchState = if (session != null or env_script != null) &wstate else null;
 
     std.debug.print(
         "labelle-web: serving {s}\n" ++
@@ -350,7 +353,7 @@ fn handleConnection(
     // the page to reload. Answered before static routing so the reserved
     // path never hits the filesystem while watching. Without a watcher,
     // the route remains available to ordinary project assets.
-    if (watch_state != null and std.mem.eql(u8, rel.?, livereload_rel)) {
+    if (watch_state != null and watch_state.?.session != null and std.mem.eql(u8, rel.?, livereload_rel)) {
         const version = if (watch_state) |ws| ws.version.load(.acquire) else 0;
         var buf: [24]u8 = undefined;
         const vbody = std.fmt.bufPrint(&buf, "{d}", .{version}) catch "0";
@@ -368,6 +371,11 @@ fn handleConnection(
     // resolved once for this request so its path checks and its read agree
     // on one generation. The previous publication is kept while a newer one
     // is switched in, so a request never sees a partial tree.
+    // The generation this page is served from: read BEFORE resolving the
+    // publication. The CLI switches `output_dir` first and advances the
+    // generation after, so the embedded value is never newer than the files
+    // served; at worst it is older, which costs one extra reload.
+    const served_generation: u64 = if (watch_state) |ws| ws.version.load(.acquire) else 0;
     const published: ?[:0]u8 = if (watch_state) |ws| if (ws.session) |session| (watch.servedRoot(allocator, io, session) catch {
         try request.respond("503 Service Unavailable\n", .{ .status = .service_unavailable });
         return;
@@ -450,15 +458,16 @@ fn handleConnection(
     };
     defer allocator.free(body);
 
-    // Under `--watch`, splice the live-reload client into served HTML so
-    // the open tab starts polling the version endpoint. Non-HTML assets
-    // (wasm/js/png/…) and non-watch serves pass through untouched.
+    // Served HTML gets the `labelle run` options first in <head> and, in a
+    // watch session, the reload client seeded with its generation. Other
+    // assets pass through untouched.
     const is_html = std.mem.startsWith(u8, content_type, "text/html");
-    const send_body: []const u8 = if (watch_state != null and is_html)
-        try injectReloadScript(allocator, body)
-    else
-        body;
-    defer if (send_body.ptr != body.ptr) allocator.free(send_body);
+    const env_script: ?[]const u8 = if (watch_state) |ws| ws.run_env_script else null;
+    const with_env: []const u8 = if (is_html and env_script != null) try injectFirst(allocator, body, env_script.?) else body;
+    defer if (with_env.ptr != body.ptr) allocator.free(with_env);
+    const reload = is_html and watch_state != null and watch_state.?.session != null;
+    const send_body: []const u8 = if (reload) try injectReloadScript(allocator, with_env, served_generation) else with_env;
+    defer if (send_body.ptr != with_env.ptr) allocator.free(send_body);
 
     // `request.respond` omits the body for HEAD requests automatically
     // while still emitting a `content-length` reflecting the real file
@@ -555,45 +564,111 @@ const livereload_path = "/__labelle_livereload";
 /// The `web_dir`-relative form `resolveTarget` yields for that path.
 const livereload_rel = "__labelle_livereload";
 
-/// Client snippet spliced into served HTML under `--watch`. Polls the
-/// version endpoint once a second; when the value changes (the watcher
-/// bumped it after a rebuild) it reloads the page. Plain ES5 + `fetch`,
-/// no dependencies — works in every browser that can run a WASM game.
-const reload_client_js =
-    \\<script>
-    \\(function () {
-    \\  var current = null;
-    \\  function poll() {
-    \\    fetch("/__labelle_livereload", { cache: "no-store" })
-    \\      .then(function (r) { return r.text(); })
-    \\      .then(function (v) {
-    \\        if (current === null) { current = v; }
-    \\        else if (v !== current) { location.reload(); return; }
-    \\        setTimeout(poll, 1000);
-    \\      })
-    \\      .catch(function () { setTimeout(poll, 2000); });
-    \\  }
-    \\  poll();
-    \\})();
-    \\</script>
-    \\
-;
+/// The reload client spliced into served HTML in a watch session. It starts
+/// from `generation`, the publication the page was served from, and polls
+/// the version endpoint once a second; any other value reloads the page. A
+/// generation published between serving the page and its first poll is
+/// therefore a reload, not a new baseline. Plain ES5 + `fetch`.
+fn reloadClient(allocator: std.mem.Allocator, generation: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\<script>
+        \\(function () {{
+        \\  var current = "{d}";
+        \\  function poll() {{
+        \\    fetch("/__labelle_livereload", {{ cache: "no-store" }})
+        \\      .then(function (r) {{ return r.text(); }})
+        \\      .then(function (v) {{
+        \\        if (v !== current) {{ location.reload(); return; }}
+        \\        setTimeout(poll, 1000);
+        \\      }})
+        \\      .catch(function () {{ setTimeout(poll, 2000); }});
+        \\  }}
+        \\  poll();
+        \\}})();
+        \\</script>
+        \\
+    , .{generation});
+}
+
+/// The `labelle run` options (`run.env`: `LABELLE_SCENE`, `LABELLE_PROFILE`,
+/// ...) for a page, as a script placed first in `<head>`: it publishes them
+/// as `window.LABELLE_RUN_ENV` and adds a `Module.preRun` step copying them
+/// into Emscripten's `ENV`, so the game's `getenv` (the engine's
+/// `requestedScene()` reads `LABELLE_SCENE`) sees them as on desktop. The
+/// Module object is created if absent and otherwise extended, which classic
+/// glue (`var Module = typeof Module != "undefined" ? Module : {}`) and
+/// `LabelleLoader.install(window.Module || {})` both keep. Null when there
+/// are no options. Caller owns the result.
+pub fn runEnvScript(allocator: std.mem.Allocator, env: []const RunEnv) !?[]u8 {
+    if (env.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer };
+    try jws.beginObject();
+    for (env) |pair| {
+        try jws.objectField(pair.name);
+        try jws.write(pair.value);
+    }
+    try jws.endObject();
+    const json = out.written();
+    // `</` would end the script element early; `<\/` is the same JSON string.
+    const safe = try std.mem.replaceOwned(u8, allocator, json, "</", "<\\/");
+    defer allocator.free(safe);
+    return try std.fmt.allocPrint(allocator,
+        \\<script>
+        \\window.LABELLE_RUN_ENV = {s};
+        \\(function (m) {{
+        \\  m.preRun = [].concat(m.preRun || []);
+        \\  m.preRun.push(function () {{
+        \\    var env = typeof ENV !== "undefined" ? ENV : m.ENV;
+        \\    if (!env) return;
+        \\    for (var k in window.LABELLE_RUN_ENV) env[k] = window.LABELLE_RUN_ENV[k];
+        \\  }});
+        \\}})(window.Module = window.Module || {{}});
+        \\</script>
+        \\
+    , .{safe});
+}
+
+pub const RunEnv = struct { name: []const u8, value: []const u8 };
 
 /// Shared between the generation poller and the serve loop (`watch.zig`).
 const WatchState = watch.State;
 
-/// Splice `reload_client_js` into `html` just before `</body>` (or append
-/// it when there's no body tag). Caller owns the returned buffer.
-fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
-    const marker = "</body>";
-    if (std.mem.lastIndexOf(u8, html, marker)) |idx| {
-        var out = try allocator.alloc(u8, html.len + reload_client_js.len);
-        @memcpy(out[0..idx], html[0..idx]);
-        @memcpy(out[idx..][0..reload_client_js.len], reload_client_js);
-        @memcpy(out[idx + reload_client_js.len ..], html[idx..]);
-        return out;
+/// Splice `script` into `html` just before `</body>` (or append it when
+/// there's no body tag). Caller owns the returned buffer.
+fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
+    if (std.mem.lastIndexOf(u8, html, "</body>")) |idx| return std.mem.concat(allocator, u8, &.{ html[0..idx], script, html[idx..] });
+    return std.mem.concat(allocator, u8, &.{ html, script });
+}
+
+/// Splice `script` right after the opening `<head ...>` tag, ahead of every
+/// page script; else after `<body ...>`; else at the start.
+fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
+    const at = tagEnd(html, "<head") orelse tagEnd(html, "<body") orelse 0;
+    return std.mem.concat(allocator, u8, &.{ html[0..at], script, html[at..] });
+}
+
+/// The index just past the `>` of the first `<name` tag (case-insensitive,
+/// not a longer tag name such as `<header>`).
+fn tagEnd(html: []const u8, open: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(html, from, open)) |at| {
+        const next = at + open.len;
+        if (next < html.len and (html[next] == '>' or std.ascii.isWhitespace(html[next]))) {
+            const close = std.mem.indexOfScalarPos(u8, html, next, '>') orelse return null;
+            return close + 1;
+        }
+        from = next;
     }
-    return std.mem.concat(allocator, u8, &.{ html, reload_client_js });
+    return null;
+}
+
+/// The reload client for `generation`, before `</body>`.
+fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8, generation: u64) ![]u8 {
+    const client = try reloadClient(allocator, generation);
+    defer allocator.free(client);
+    return injectBeforeBodyEnd(allocator, html, client);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -880,7 +955,7 @@ test "handleConnection: root 404s when neither a shell nor game.html exists" {
 test "injectReloadScript: splices before </body>" {
     const alloc = std.testing.allocator;
     const html = "<html><body><canvas></canvas></body></html>";
-    const out = try injectReloadScript(alloc, html);
+    const out = try injectReloadScript(alloc, html, 0);
     defer alloc.free(out);
     // The client script is present...
     try std.testing.expect(std.mem.indexOf(u8, out, "__labelle_livereload") != null);
@@ -895,56 +970,106 @@ test "injectReloadScript: splices before </body>" {
 test "injectReloadScript: appends when there is no </body>" {
     const alloc = std.testing.allocator;
     const html = "<h1>bare fragment</h1>";
-    const out = try injectReloadScript(alloc, html);
+    const out = try injectReloadScript(alloc, html, 0);
     defer alloc.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "<h1>bare fragment</h1>"));
     try std.testing.expect(std.mem.indexOf(u8, out, "__labelle_livereload") != null);
 }
-test "handleConnection: --watch answers the version endpoint and injects the reload client" {
+/// One GET through `handleConnection` on its own thread; returns the response.
+fn testGet(io: std.Io, alloc: std.mem.Allocator, server: *std.Io.net.Server, port: u16, web_dir: []const u8, state: ?*WatchState, target: []const u8) ![]u8 {
+    const t = try std.Thread.spawn(.{}, testServeNWatch, .{ io, alloc, server, web_dir, @as(?[]const u8, null), @as(usize, 1), state });
+    defer t.join();
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    const s = try peer.connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{target});
+    try w.interface.flush();
+    var rbuf: [8192]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    return r.interface.allocRemaining(alloc, .unlimited);
+}
+
+fn testBody(resp: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return resp;
+    return resp[at + 4 ..];
+}
+
+test "handleConnection: a watch session seeds the reload client with the served generation" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-
-    var build_tmp = std.testing.tmpDir(.{});
-    defer build_tmp.cleanup();
-    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
-    defer alloc.free(web_dir);
-    try build_tmp.dir.writeFile(io, .{
-        .sub_path = "index.html",
-        .data = "<html><body><canvas id=game></canvas></body></html>",
-    });
-
-    var wstate = WatchState{};
-    _ = wstate.version.fetchAdd(7, .release);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "out/web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/web/index.html", .data = "<html><body><canvas id=game></canvas></body></html>" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const out = try std.fs.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(out);
+    const gen = try std.fs.path.join(alloc, &.{ root, "generation" });
+    defer alloc.free(gen);
+    var wstate = WatchState{ .session = .{ .generation_file = gen, .output_dir = out } };
+    wstate.version.store(1, .release);
 
     const bound = testBindFreePort(io) orelse return error.NoFreePort;
     var server = bound.server;
-    const port = bound.port;
     defer server.deinit(io);
 
-    const t = try std.Thread.spawn(.{}, testServeNWatch, .{ io, alloc, &server, web_dir, @as(?[]const u8, null), @as(usize, 2), &wstate });
-    defer t.join();
+    // The page is served at generation 1 and says so.
+    const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "var current = \"1\";") != null);
+    // The race: generation 2 is published before the page's first poll.
+    wstate.version.store(2, .release);
+    const polled = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
+    defer alloc.free(polled);
+    try std.testing.expectEqualStrings("2", testBody(polled));
+    // The client compares with its seed, never adopts the first answer as
+    // its baseline: "2" !== "1" reloads the page.
+    try std.testing.expect(std.mem.indexOf(u8, page, "current === null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "if (v !== current) { location.reload(); return; }") != null);
+}
 
-    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    const Case = struct { target: []const u8, want: []const u8 };
-    for ([_]Case{
-        // Version endpoint reflects the current build version.
-        .{ .target = "/__labelle_livereload", .want = "7" },
-        // The root HTML gets the reload client spliced in.
-        .{ .target = "/", .want = "__labelle_livereload" },
+test "handleConnection: run options reach the page first in <head>; the endpoint stays a file outside watch" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "<!doctype html><html><HEAD lang=en><script>var Module={};</script></head><body></body></html>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "__labelle_livereload", .data = "asset" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const script = (try runEnvScript(alloc, &.{ .{ .name = "LABELLE_SCENE", .value = "intro</script>" }, .{ .name = "LABELLE_PROFILE", .value = "1" } })).?;
+    defer alloc.free(script);
+    var wstate = WatchState{ .run_env_script = script };
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+
+    const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
+    defer alloc.free(page);
+    const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro<\\/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
+    try std.testing.expect(env_at > std.mem.indexOf(u8, page, "<HEAD lang=en>").?);
+    try std.testing.expect(env_at < std.mem.indexOf(u8, page, "var Module={}").?);
+    try std.testing.expect(std.mem.indexOf(u8, page, "location.reload") == null);
+    const asset = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
+    defer alloc.free(asset);
+    try std.testing.expectEqualStrings("asset", testBody(asset));
+}
+
+test "injectFirst: after <head>, else <body>, else at the start; never inside <header>" {
+    const alloc = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "<html><head><title>t</title></head></html>", "<html><head>S<title>t</title></head></html>" },
+        .{ "<html><body class=x><header>h</header></body></html>", "<html><body class=x>S<header>h</header></body></html>" },
+        .{ "<p>fragment</p>", "S<p>fragment</p>" },
     }) |case| {
-        const s = try peer.connect(io, .{ .mode = .stream });
-        defer s.close(io);
-        var wbuf: [512]u8 = undefined;
-        var w = s.writer(io, &wbuf);
-        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{case.target});
-        try w.interface.flush();
-
-        var rbuf: [8192]u8 = undefined;
-        var r = s.reader(io, &rbuf);
-        const resp = try r.interface.allocRemaining(alloc, .unlimited);
-        defer alloc.free(resp);
-        try std.testing.expect(std.mem.indexOf(u8, resp, case.want) != null);
+        const got = try injectFirst(alloc, case[0], "S");
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
     }
+    try std.testing.expectEqual(@as(?[]u8, null), try runEnvScript(alloc, &.{}));
 }
 
 test "handleConnection: a watch session serves the publication output_dir names, never web_dir" {

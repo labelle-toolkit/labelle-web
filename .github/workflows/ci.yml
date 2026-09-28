@@ -146,6 +146,7 @@ jobs:
         with:
           version: 0.16.0
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: '3.12'
       # labelle-cli v2.1.0: provider contract 1.3.0 (cache_dir, env_file,
@@ -161,10 +162,16 @@ jobs:
       - run: zig build install-provider
       - name: Exercise CLI discovery, serving, export and hook contexts
         shell: bash
-        run: python3 tests/provider/e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
+        env:
+          # setup-python's interpreter by path: `python3` is not on every Windows runner.
+          PYTHON: ${{ steps.py.outputs.python-path }}
+        run: '"$PYTHON" tests/provider/e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"'
       - name: Toolchain hooks, doctor and browser watch through the pipeline
         shell: bash
-        run: python3 tests/provider/toolchain_e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
+        env:
+          # setup-python's interpreter by path: `python3` is not on every Windows runner.
+          PYTHON: ${{ steps.py.outputs.python-path }}
+        run: '"$PYTHON" tests/provider/toolchain_e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"'
 
   # The real toolchain bootstrap (RFC labelle-cli#466 §8): a fresh
   # `labelle init` project builds for wasm with a clean LABELLE_HOME, EMSDK
@@ -191,6 +198,7 @@ jobs:
         with:
           version: 0.16.0
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: '3.12'
       - uses: actions/checkout@v4
@@ -203,7 +211,13 @@ jobs:
         working-directory: .test-cli
       - name: Build wasm from zero
         shell: bash
-        run: python3 tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode managed
+        env:
+          # setup-python's interpreter by path: `python3` is not on every Windows runner.
+          PYTHON: ${{ steps.py.outputs.python-path }}
+        run: '"$PYTHON" tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode managed'
       - name: External EMSDK is passed through without a download
         shell: bash
-        run: python3 tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode passthrough
+        env:
+          # setup-python's interpreter by path: `python3` is not on every Windows runner.
+          PYTHON: ${{ steps.py.outputs.python-path }}
+        run: '"$PYTHON" tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode passthrough'

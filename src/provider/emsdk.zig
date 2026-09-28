@@ -62,6 +62,8 @@ pub const launcher_name = if (is_windows) "emsdk.bat" else "emsdk";
 pub const emcc_name = if (is_windows) "emcc.bat" else "emcc";
 pub const em_config_name = ".emscripten";
 pub const marker_name = ".labelle-web-install";
+/// In an in-place (package mode) activation: the version activated there.
+pub const package_marker_name = ".labelle-web-activated";
 const sep = std.fs.path.sep_str;
 pub const emscripten_rel = "upstream" ++ sep ++ "emscripten";
 pub const emcc_rel = emscripten_rel ++ sep ++ emcc_name;
@@ -72,21 +74,33 @@ pub const emcc_rel = emscripten_rel ++ sep ++ emcc_name;
 /// processes; tests substitute a fake.
 pub const Runner = struct {
     ctx: ?*anyopaque = null,
-    /// Run `argv` in `cwd`, the child's stdout sent to stderr. Returns the
-    /// exit status (a signal is 255).
-    step: *const fn (ctx: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!u8,
+    /// Run `argv` in `cwd` with `env` added to the inherited environment,
+    /// the child's stdout sent to stderr. Returns the exit status (a signal
+    /// is 255).
+    step: *const fn (ctx: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8, env: []const EnvVar) anyerror!u8,
     /// Run `argv` in `cwd` and return its stdout (null on failure).
     capture: *const fn (ctx: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!?[]u8,
 };
 
 pub const system: Runner = .{ .step = systemStep, .capture = systemCapture };
 
-fn systemStep(_: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!u8 {
+/// The provider's inherited environment, for children that need additions
+/// (`main` sets it; null keeps the plain inherited environment).
+pub var environ: ?std.process.Environ = null;
+
+fn systemStep(_: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8, env: []const EnvVar) anyerror!u8 {
+    var map: ?std.process.Environ.Map = null;
+    defer if (map) |*m| m.deinit();
+    if (env.len != 0) if (environ) |inherited| {
+        map = try inherited.createMap(a);
+        for (env) |pair| try map.?.put(pair.name, pair.value);
+    };
+    const environ_map: ?*const std.process.Environ.Map = if (map) |*m| m else null;
     if (is_windows) {
         // Handing the stderr handle to a Windows child as its stdout failed
         // with NoDevice on windows-latest; capture (as the CLI's own emsdk
         // steps did) and relay both streams to stderr afterwards.
-        const result = try std.process.run(a, io, .{ .argv = argv, .cwd = if (cwd) |c| .{ .path = c } else .inherit });
+        const result = try std.process.run(a, io, .{ .argv = argv, .cwd = if (cwd) |c| .{ .path = c } else .inherit, .environ_map = environ_map });
         defer a.free(result.stdout);
         defer a.free(result.stderr);
         var buf: [4096]u8 = undefined;
@@ -102,6 +116,7 @@ fn systemStep(_: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+        .environ_map = environ_map,
         .stdin = .ignore,
         .stdout = stdio.childStdout(),
         .stderr = .inherit,
@@ -125,6 +140,16 @@ fn systemCapture(_: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const
     }
     a.free(result.stdout);
     return null;
+}
+
+/// The environment the emsdk launcher gets: on Windows `EMSDK_PYTHON`, which
+/// `emsdk.bat` (and later `emcc.bat`) honour, names the interpreter this
+/// provider verified instead of whatever `python` resolves to. The POSIX
+/// launcher runs `python3`, the command verified there.
+pub fn launcherEnv(a: std.mem.Allocator, python: ?[]const u8, windows: bool) ![]const EnvVar {
+    const cmd = python orelse return &.{};
+    if (!windows) return &.{};
+    return a.dupe(EnvVar, &.{.{ .name = "EMSDK_PYTHON", .value = cmd }});
 }
 
 fn launcherArgv(a: std.mem.Allocator, launcher: []const u8, sub: []const u8, version: []const u8) ![]const []const u8 {
@@ -206,6 +231,8 @@ pub const Inputs = struct {
     /// `EMSDK` from the environment the provider inherited.
     inherited: ?[]const u8,
     offline: bool,
+    /// The verified Python 3 command (`findPython`), for the launcher.
+    python: ?[]const u8 = null,
 
     pub fn version(self: Inputs) []const u8 {
         return self.emsdk.version orelse default_version;
@@ -231,8 +258,8 @@ pub fn plan(a: std.mem.Allocator, io: std.Io, in: Inputs) !Plan {
                 return error.InheritedEmsdkMissing;
             };
             const abs = try std.fs.path.resolve(a, &.{ in.project_dir, root });
-            if (!hasEmcc(a, io, abs)) {
-                std.debug.print("labelle-web: EMSDK={s} has no {s}\n", .{ abs, emcc_rel });
+            if (!activated(a, io, abs)) {
+                std.debug.print("labelle-web: EMSDK={s} is not an activated emsdk: it needs {s} and {s} (run `emsdk activate`)\n", .{ abs, emcc_rel, em_config_name });
                 return error.InheritedEmsdkMissing;
             }
             return .{ .ready = .{ .root = abs, .source = .inherited } };
@@ -242,14 +269,14 @@ pub fn plan(a: std.mem.Allocator, io: std.Io, in: Inputs) !Plan {
     if (in.emsdk.source == .managed) {
         if (in.inherited) |root| if (root.len != 0) {
             const abs = try std.fs.path.resolve(a, &.{ in.project_dir, root });
-            if (hasEmcc(a, io, abs)) return .{ .ready = .{ .root = abs, .source = .inherited } };
-            std.debug.print("labelle-web: ignoring EMSDK={s}: it has no {s}\n", .{ abs, emcc_rel });
+            if (activated(a, io, abs)) return .{ .ready = .{ .root = abs, .source = .inherited } };
+            std.debug.print("labelle-web: ignoring EMSDK={s}: not an activated emsdk ({s} and {s} needed)\n", .{ abs, emcc_rel, em_config_name });
         };
     }
     if (in.emsdk.root) |root| {
         const abs = try std.fs.path.resolve(a, &.{ in.project_dir, root });
-        if (!hasEmcc(a, io, abs)) {
-            std.debug.print("labelle-web: settings emsdk.root {s} has no {s}\n", .{ abs, emcc_rel });
+        if (!activated(a, io, abs)) {
+            std.debug.print("labelle-web: settings emsdk.root {s} is not an activated emsdk: it needs {s} and {s} (run `emsdk activate`)\n", .{ abs, emcc_rel, em_config_name });
             return error.EmsdkRootInvalid;
         }
         return .{ .ready = .{ .root = abs, .source = .root } };
@@ -266,7 +293,7 @@ pub fn ensure(a: std.mem.Allocator, io: std.Io, runner: Runner, in: Inputs) !?Pl
     return switch (p) {
         .ready => p,
         .package => null,
-        .install => |i| .{ .ready = .{ .root = try ensureManaged(a, io, runner, in.cache_dir, i.version, in.offline), .source = .managed } },
+        .install => |i| .{ .ready = .{ .root = try ensureManaged(a, io, runner, in.cache_dir, i.version, in.offline, in.python), .source = .managed } },
     };
 }
 
@@ -274,7 +301,7 @@ pub fn ensure(a: std.mem.Allocator, io: std.Io, runner: Runner, in: Inputs) !?Pl
 
 /// Install `version` under `cache_dir` unless a complete install exists.
 /// Returns the install directory.
-pub fn ensureManaged(a: std.mem.Allocator, io: std.Io, runner: Runner, cache_dir: []const u8, version: []const u8, offline: bool) ![]const u8 {
+pub fn ensureManaged(a: std.mem.Allocator, io: std.Io, runner: Runner, cache_dir: []const u8, version: []const u8, offline: bool, python: ?[]const u8) ![]const u8 {
     if (!settings_mod.safeVersion(version)) return error.InvalidEmsdkVersion;
     const cwd = std.Io.Dir.cwd();
     const dir = try managedDir(a, cache_dir, version);
@@ -311,7 +338,7 @@ pub fn ensureManaged(a: std.mem.Allocator, io: std.Io, runner: Runner, cache_dir
     defer cwd.deleteTree(io, staging) catch {};
 
     std.debug.print("labelle-web: installing emsdk {s} into {s}\n", .{ version, dir });
-    if (try runner.step(runner.ctx, io, a, &.{ "git", "clone", "--depth", "1", "--branch", version, git_url, staging }, null) != 0) {
+    if (try runner.step(runner.ctx, io, a, &.{ "git", "clone", "--depth", "1", "--branch", version, git_url, staging }, null, &.{}) != 0) {
         std.debug.print("labelle-web: git clone of emsdk {s} failed\n", .{version});
         return error.EmsdkFetchFailed;
     }
@@ -328,7 +355,7 @@ pub fn ensureManaged(a: std.mem.Allocator, io: std.Io, runner: Runner, cache_dir
         std.debug.print("  commit verified ({s})\n", .{commit});
     } else std.debug.print("  note: emsdk {s} has no pinned commit; trusting the HTTPS tag fetch\n", .{version});
 
-    try activateIn(a, io, runner, staging, version);
+    try activateIn(a, io, runner, staging, version, python);
     const marker = try std.fs.path.join(a, &.{ staging, marker_name });
     const record = try std.fmt.allocPrint(a, "{{\"layout\":\"{s}\",\"version\":\"{s}\",\"commit\":\"{s}\",\"host\":\"{s}\"}}\n", .{ layout, version, pinnedCommit(version) orelse "tag", host_key });
     try cwd.writeFile(io, .{ .sub_path = marker, .data = record });
@@ -351,7 +378,8 @@ fn removeStale(a: std.mem.Allocator, io: std.Io, parent: []const u8, prefix: []c
 }
 
 /// `emsdk install <v>` then `emsdk activate <v>` in `root`, checked.
-fn activateIn(a: std.mem.Allocator, io: std.Io, runner: Runner, root: []const u8, version: []const u8) !void {
+fn activateIn(a: std.mem.Allocator, io: std.Io, runner: Runner, root: []const u8, version: []const u8, python: ?[]const u8) !void {
+    const env = try launcherEnv(a, python, is_windows);
     const launcher = try std.fs.path.join(a, &.{ root, launcher_name });
     if (!is_windows) {
         if (std.Io.Dir.cwd().openFile(io, launcher, .{})) |file| {
@@ -361,7 +389,7 @@ fn activateIn(a: std.mem.Allocator, io: std.Io, runner: Runner, root: []const u8
     }
     for ([_][]const u8{ "install", "activate" }) |sub| {
         std.debug.print("  emsdk {s} {s}\n", .{ sub, version });
-        if (try runner.step(runner.ctx, io, a, try launcherArgv(a, launcher, sub, version), root) != 0) {
+        if (try runner.step(runner.ctx, io, a, try launcherArgv(a, launcher, sub, version), root, env) != 0) {
             std.debug.print("labelle-web: `emsdk {s} {s}` failed in {s}\n", .{ sub, version, root });
             return error.EmsdkStepFailed;
         }
@@ -399,7 +427,7 @@ pub fn findPackages(a: std.mem.Allocator, io: std.Io, target_dir: []const u8) ![
 
 /// Activate every fetched emsdk in place (each under its own lock) and
 /// return the one the target's `build.zig.zon` names, else the first.
-pub fn activatePackages(a: std.mem.Allocator, io: std.Io, runner: Runner, target_dir: []const u8, cache_dir: []const u8, version: []const u8, offline: bool) ![]const u8 {
+pub fn activatePackages(a: std.mem.Allocator, io: std.Io, runner: Runner, target_dir: []const u8, cache_dir: []const u8, version: []const u8, offline: bool, python: ?[]const u8) ![]const u8 {
     if (!settings_mod.safeVersion(version)) return error.InvalidEmsdkVersion;
     const pkgs = try findPackages(a, io, target_dir);
     if (pkgs.len == 0) {
@@ -410,9 +438,9 @@ pub fn activatePackages(a: std.mem.Allocator, io: std.Io, runner: Runner, target
     const locks = try std.fs.path.join(a, &.{ cache_dir, "emsdk", layout, "package-locks" });
     try cwd.createDirPath(io, locks);
     for (pkgs) |pkg| {
-        if (activated(a, io, pkg)) continue;
+        if (try packageCurrent(a, io, pkg, version)) continue;
         if (offline) {
-            std.debug.print("labelle-web: the fetched emsdk {s} is not activated and LABELLE_OFFLINE is set\n", .{pkg});
+            std.debug.print("labelle-web: the fetched emsdk {s} is not activated for {s} and LABELLE_OFFLINE is set\n", .{ pkg, version });
             return error.EmsdkNotInstalledOffline;
         }
         const lock_path = try std.fmt.allocPrint(a, "{s}" ++ sep ++ "{x}.lock", .{ locks, std.hash.Wyhash.hash(0, pkg) });
@@ -421,15 +449,29 @@ pub fn activatePackages(a: std.mem.Allocator, io: std.Io, runner: Runner, target
             return error.EmsdkInstallLockFailed;
         };
         defer lock.close(io);
-        if (activated(a, io, pkg)) continue;
+        if (try packageCurrent(a, io, pkg, version)) continue;
         std.debug.print("labelle-web: activating fetched emsdk {s} in place: {s}\n", .{ version, pkg });
         makeTreeWritable(io, pkg);
-        try activateIn(a, io, runner, pkg, version);
+        try activateIn(a, io, runner, pkg, version, python);
+        const marker = try std.fs.path.join(a, &.{ pkg, package_marker_name });
+        try cwd.writeFile(io, .{ .sub_path = marker, .data = version });
     }
     if (try zonEmsdkHash(a, io, target_dir)) |hash| {
         for (pkgs) |pkg| if (std.mem.eql(u8, std.fs.path.basename(pkg), hash)) return pkg;
     }
     return pkgs[0];
+}
+
+/// Package mode keeps its own record of what it activated in a fetched tree.
+/// A tree activated for another `emsdk.version` (settings changed), or by
+/// someone else (the tree carries no record, e.g. the CLI 2.x core's own
+/// activation), is re-activated for the requested version: `emsdk install`
+/// adds it beside the old one and `emsdk activate` switches `.emscripten`.
+fn packageCurrent(a: std.mem.Allocator, io: std.Io, pkg: []const u8, version: []const u8) !bool {
+    if (!activated(a, io, pkg)) return false;
+    const marker = try std.fs.path.join(a, &.{ pkg, package_marker_name });
+    const recorded = std.Io.Dir.cwd().readFileAlloc(io, marker, a, .limited(256)) catch return false;
+    return std.mem.eql(u8, std.mem.trim(u8, recorded, " \r\n"), version);
 }
 
 /// The `emsdk` dependency hash in the target's `build.zig.zon`, if any.
@@ -473,37 +515,62 @@ pub const Contribution = struct {
 
 /// `EMSDK`, `EM_CONFIG` (when the root has one) and `upstream/emscripten`
 /// in front of PATH.
-pub fn contribution(a: std.mem.Allocator, io: std.Io, root: []const u8) !Contribution {
+pub fn contribution(a: std.mem.Allocator, io: std.Io, root: []const u8, python: ?[]const u8) !Contribution {
     var set: std.ArrayList(EnvVar) = .empty;
     try set.append(a, .{ .name = "EMSDK", .value = root });
     const config = try std.fs.path.join(a, &.{ root, em_config_name });
     if (exists(io, config)) try set.append(a, .{ .name = "EM_CONFIG", .value = config });
+    // emcc.bat runs `%EMSDK_PYTHON%` when set: the same interpreter as the launcher.
+    try set.appendSlice(a, try launcherEnv(a, python, is_windows));
     const bin = try std.fs.path.join(a, &.{ root, emscripten_rel });
     return .{ .set = set.items, .path_prepend = try a.dupe([]const u8, &.{bin}) };
 }
 
-pub fn writeEnvFile(a: std.mem.Allocator, io: std.Io, path: []const u8, root: []const u8) !void {
-    const value = try contribution(a, io, root);
+pub fn writeEnvFile(a: std.mem.Allocator, io: std.Io, path: []const u8, root: []const u8, python: ?[]const u8) !void {
+    const value = try contribution(a, io, root, python);
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
 // ── Python ──────────────────────────────────────────────────────────────
 
-/// The Python command emsdk and emcc will run, if one works: `python3` on
-/// POSIX (the launcher's and emcc's interpreter), `python` or `python3` on
-/// Windows. Running `--version` also rejects the Windows Store stub.
-pub fn findPython(a: std.mem.Allocator, io: std.Io, runner: Runner) ?[]const u8 {
+/// The outcome of looking for the interpreter emsdk and emcc will run.
+pub const PythonCheck = union(enum) {
+    /// A command that runs Python 3.
+    found: []const u8,
+    /// The first command that ran was Python 2 (and no Python 3 was found).
+    python2: []const u8,
+    missing,
+};
+
+/// Look for Python 3: `python3` on POSIX (the launcher's and emcc's
+/// interpreter), `python` then `python3` on Windows. Each candidate runs
+/// `import sys; print(sys.version_info[0])`, which answers on Python 2 and 3
+/// alike and fails on the Windows Store stub; only `3` is accepted.
+pub fn checkPython(a: std.mem.Allocator, io: std.Io, runner: Runner) PythonCheck {
     const candidates: []const []const u8 = if (is_windows) &.{ "python", "python3" } else &.{"python3"};
+    var old: ?[]const u8 = null;
     for (candidates) |cmd| {
-        const out = runner.capture(runner.ctx, io, a, &.{ cmd, "--version" }, null) catch null;
-        if (out) |bytes| {
-            a.free(bytes);
-            return cmd;
-        }
+        const out = (runner.capture(runner.ctx, io, a, &.{ cmd, "-c", "import sys; print(sys.version_info[0])" }, null) catch null) orelse continue;
+        defer a.free(out);
+        const major = std.mem.trim(u8, out, " \t\r\n");
+        if (std.mem.eql(u8, major, "3")) return .{ .found = cmd };
+        if (old == null) old = cmd;
     }
-    return null;
+    return if (old) |cmd| .{ .python2 = cmd } else .missing;
 }
+
+pub fn findPython(a: std.mem.Allocator, io: std.Io, runner: Runner) ?[]const u8 {
+    return switch (checkPython(a, io, runner)) {
+        .found => |cmd| cmd,
+        else => null,
+    };
+}
+
+pub const python2_found =
+    "labelle-web: `{s}` is Python 2, and emsdk and emcc need Python 3.\n" ++
+    "  fix: run `labelle install python` (the CLI puts its managed Python on PATH),\n" ++
+    "  or install Python 3 and put it first on PATH.\n";
 
 pub const python_missing =
     "labelle-web: emsdk and emcc need Python 3, and none was found on PATH.\n" ++
@@ -523,6 +590,10 @@ const Fake = struct {
     installs: usize = 0,
     fail_activate: bool = false,
     has_python: bool = true,
+    /// What `-c "print(sys.version_info[0])"` answers per command.
+    python_major: []const u8 = "3",
+    /// `EMSDK_PYTHON` as the last launcher step received it.
+    launcher_python: ?[]const u8 = null,
 
     fn runner(self: *Fake) Runner {
         return .{ .ctx = self, .step = step, .capture = capture };
@@ -535,8 +606,12 @@ const Fake = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fake" });
     }
 
-    fn step(ctx: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!u8 {
+    fn step(ctx: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8, env: []const EnvVar) anyerror!u8 {
         const self: *Fake = @ptrCast(@alignCast(ctx.?));
+        self.launcher_python = null;
+        for (env) |pair| if (std.mem.eql(u8, pair.name, "EMSDK_PYTHON")) {
+            self.launcher_python = pair.value;
+        };
         const sub_at: usize = if (is_windows and std.mem.eql(u8, argv[0], "cmd")) 3 else 1;
         if (std.mem.eql(u8, argv[0], "git") and std.mem.eql(u8, argv[1], "clone")) {
             self.clones += 1;
@@ -562,7 +637,7 @@ const Fake = struct {
     fn capture(ctx: ?*anyopaque, _: std.Io, a: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8) anyerror!?[]u8 {
         const self: *Fake = @ptrCast(@alignCast(ctx.?));
         if (std.mem.eql(u8, argv[0], "git")) return try a.dupe(u8, self.commit);
-        if (std.mem.startsWith(u8, argv[0], "python")) return if (self.has_python) try a.dupe(u8, "Python 3.12.0\n") else null;
+        if (std.mem.startsWith(u8, argv[0], "python")) return if (self.has_python) try std.fmt.allocPrint(a, "{s}\n", .{self.python_major}) else null;
         return null;
     }
 };
@@ -589,6 +664,12 @@ const Tmp = struct {
     }
 };
 
+/// An activated-looking emsdk: emcc and the `.emscripten` config.
+fn fakeActivated(a: std.mem.Allocator, root: []const u8) !void {
+    try Fake.touch(testing.io, a, &.{ root, emcc_rel });
+    try Fake.touch(testing.io, a, &.{ root, em_config_name });
+}
+
 fn inputs(t: *Tmp, emsdk: settings_mod.Emsdk, inherited: ?[]const u8) !Inputs {
     return .{ .emsdk = emsdk, .project_dir = try t.path(&.{"project"}), .cache_dir = try t.path(&.{"cache"}), .inherited = inherited, .offline = false };
 }
@@ -610,7 +691,7 @@ test "plan: an inherited EMSDK with emcc is passed through, without an install" 
     defer t.deinit();
     const a = t.arena.allocator();
     const ext = try t.path(&.{"external-emsdk"});
-    try Fake.touch(testing.io, a, &.{ ext, emcc_rel });
+    try fakeActivated(a, ext);
     var fake: Fake = .{};
     const got = (try ensure(a, testing.io, fake.runner(), try inputs(&t, .{}, ext))).?;
     try testing.expectEqual(Source.inherited, got.ready.source);
@@ -624,7 +705,7 @@ test "plan: a stale inherited EMSDK falls through to emsdk.root, then to the man
     const a = t.arena.allocator();
     const stale = try t.path(&.{"stale"});
     const root = try t.path(&.{"root-emsdk"});
-    try Fake.touch(testing.io, a, &.{ root, emcc_rel });
+    try fakeActivated(a, root);
     const via_root = try plan(a, testing.io, try inputs(&t, .{ .root = root }, stale));
     try testing.expectEqual(Source.root, via_root.ready.source);
     const via_managed = try plan(a, testing.io, try inputs(&t, .{}, stale));
@@ -644,11 +725,11 @@ test "plan: strict sources refuse instead of falling back" {
     try testing.expectError(error.EmsdkRootInvalid, plan(a, testing.io, try inputs(&t, .{ .source = .root, .root = "missing" }, null)));
     // An inherited EMSDK does not override an explicit root source.
     const ext = try t.path(&.{"ext"});
-    try Fake.touch(testing.io, a, &.{ ext, emcc_rel });
+    try fakeActivated(a, ext);
     try testing.expectError(error.EmsdkRootInvalid, plan(a, testing.io, try inputs(&t, .{ .source = .root, .root = "missing" }, ext)));
     try testing.expect(try plan(a, testing.io, try inputs(&t, .{ .source = .package }, ext)) == .package);
     // A relative root resolves against the project.
-    try Fake.touch(testing.io, a, &.{ try t.path(&.{ "project", "sdk" }), emcc_rel });
+    try fakeActivated(a, try t.path(&.{ "project", "sdk" }));
     const rel = try plan(a, testing.io, try inputs(&t, .{ .source = .root, .root = "sdk" }, null));
     try testing.expectEqualStrings(try t.path(&.{ "project", "sdk" }), rel.ready.root);
 }
@@ -659,11 +740,11 @@ test "ensureManaged installs once, verifies the commit and leaves no staging" {
     const a = t.arena.allocator();
     const cache = try t.path(&.{"cache"});
     var fake: Fake = .{};
-    const dir = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, false);
+    const dir = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, false, null);
     try testing.expect(managedComplete(a, testing.io, dir));
     try testing.expectEqual(@as(usize, 1), fake.clones);
     // Complete: a second call (even offline) reuses it.
-    _ = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, true);
+    _ = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, true, null);
     try testing.expectEqual(@as(usize, 1), fake.clones);
     var parent = try std.Io.Dir.cwd().openDir(testing.io, std.fs.path.dirname(dir).?, .{ .iterate = true });
     defer parent.close(testing.io);
@@ -680,15 +761,15 @@ test "ensureManaged refuses a mismatched commit, a failed activation and an offl
     const a = t.arena.allocator();
     const cache = try t.path(&.{"cache"});
     var wrong: Fake = .{ .commit = "0000000000000000000000000000000000000000" };
-    try testing.expectError(error.EmsdkVerificationFailed, ensureManaged(a, testing.io, wrong.runner(), cache, default_version, false));
+    try testing.expectError(error.EmsdkVerificationFailed, ensureManaged(a, testing.io, wrong.runner(), cache, default_version, false, null));
     var broken: Fake = .{ .fail_activate = true };
-    try testing.expectError(error.EmsdkStepFailed, ensureManaged(a, testing.io, broken.runner(), cache, default_version, false));
+    try testing.expectError(error.EmsdkStepFailed, ensureManaged(a, testing.io, broken.runner(), cache, default_version, false, null));
     const dir = try managedDir(a, cache, default_version);
     try testing.expect(!managedComplete(a, testing.io, dir));
     var fake: Fake = .{};
-    try testing.expectError(error.EmsdkNotInstalledOffline, ensureManaged(a, testing.io, fake.runner(), cache, default_version, true));
+    try testing.expectError(error.EmsdkNotInstalledOffline, ensureManaged(a, testing.io, fake.runner(), cache, default_version, true, null));
     try testing.expectEqual(@as(usize, 0), fake.clones);
-    try testing.expectError(error.InvalidEmsdkVersion, ensureManaged(a, testing.io, fake.runner(), cache, "../x", false));
+    try testing.expectError(error.InvalidEmsdkVersion, ensureManaged(a, testing.io, fake.runner(), cache, "../x", false, null));
 }
 
 test "ensureManaged treats a tree without the marker as absent and clears stale staging" {
@@ -704,7 +785,7 @@ test "ensureManaged treats a tree without the marker as absent and clears stale 
     const stale = try std.fmt.allocPrint(a, "{s}.tmp-dead", .{dir});
     try Fake.touch(testing.io, a, &.{ stale, "partial" });
     var fake: Fake = .{};
-    _ = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, false);
+    _ = try ensureManaged(a, testing.io, fake.runner(), cache, default_version, false, null);
     try testing.expectEqual(@as(usize, 1), fake.clones);
     try testing.expect(!exists(testing.io, stale));
     try testing.expect(managedComplete(a, testing.io, dir));
@@ -726,16 +807,16 @@ test "package mode activates every fetched emsdk and prefers the one build.zig.z
         .data = ".{ .name = .t, .dependencies = .{ .emsdk = .{ .url = \"x\", .hash = \"emsdk-b\" } } }",
     });
     var fake: Fake = .{};
-    const primary = try activatePackages(a, testing.io, fake.runner(), target, try t.path(&.{"cache"}), default_version, false);
+    const primary = try activatePackages(a, testing.io, fake.runner(), target, try t.path(&.{"cache"}), default_version, false, null);
     try testing.expectEqualStrings(try t.path(&.{ "target", "zig-pkg", "emsdk-b" }), primary);
     try testing.expectEqual(@as(usize, 2), fake.installs);
     for ([_][]const u8{ "emsdk-a", "emsdk-b" }) |hash| try testing.expect(activated(a, testing.io, try t.path(&.{ "target", "zig-pkg", hash })));
     try testing.expect(!hasEmcc(a, testing.io, try t.path(&.{ "target", "zig-pkg", "other" })));
     // Idempotent: nothing left to activate, even offline.
-    _ = try activatePackages(a, testing.io, fake.runner(), target, try t.path(&.{"cache"}), default_version, true);
+    _ = try activatePackages(a, testing.io, fake.runner(), target, try t.path(&.{"cache"}), default_version, true, null);
     try testing.expectEqual(@as(usize, 2), fake.installs);
     // No fetched emsdk is a clear failure.
-    try testing.expectError(error.NoFetchedEmsdk, activatePackages(a, testing.io, fake.runner(), try t.path(&.{"empty"}), try t.path(&.{"cache"}), default_version, false));
+    try testing.expectError(error.NoFetchedEmsdk, activatePackages(a, testing.io, fake.runner(), try t.path(&.{"empty"}), try t.path(&.{"cache"}), default_version, false, null));
 }
 
 test "the env_file names EMSDK, EM_CONFIG and upstream/emscripten, in contract shape" {
@@ -746,12 +827,12 @@ test "the env_file names EMSDK, EM_CONFIG and upstream/emscripten, in contract s
     try Fake.touch(testing.io, a, &.{ root, emcc_rel });
     const file = try t.path(&.{"env.json"});
     // Without a config file only EMSDK is set.
-    try writeEnvFile(a, testing.io, file, root);
+    try writeEnvFile(a, testing.io, file, root, null);
     const Shape = struct { set: []const EnvVar, path_prepend: []const []const u8 };
     var parsed = try std.json.parseFromSliceLeaky(Shape, a, try std.Io.Dir.cwd().readFileAlloc(testing.io, file, a, .unlimited), .{});
     try testing.expectEqual(@as(usize, 1), parsed.set.len);
     try Fake.touch(testing.io, a, &.{ root, em_config_name });
-    try writeEnvFile(a, testing.io, file, root);
+    try writeEnvFile(a, testing.io, file, root, null);
     parsed = try std.json.parseFromSliceLeaky(Shape, a, try std.Io.Dir.cwd().readFileAlloc(testing.io, file, a, .unlimited), .{});
     try testing.expectEqualStrings("EMSDK", parsed.set[0].name);
     try testing.expectEqualStrings(root, parsed.set[0].value);
@@ -760,6 +841,74 @@ test "the env_file names EMSDK, EM_CONFIG and upstream/emscripten, in contract s
     try testing.expectEqual(@as(usize, 1), parsed.path_prepend.len);
     try testing.expectEqualStrings(try t.path(&.{ "sdk", "upstream", "emscripten" }), parsed.path_prepend[0]);
     try testing.expect(std.fs.path.isAbsolute(parsed.path_prepend[0]));
+}
+
+test "an emsdk root or inherited EMSDK must be activated: emcc alone is not enough" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const a = t.arena.allocator();
+    // An interrupted activation: emcc without `.emscripten`.
+    const half = try t.path(&.{"half"});
+    try Fake.touch(testing.io, a, &.{ half, emcc_rel });
+    try testing.expectError(error.EmsdkRootInvalid, plan(a, testing.io, try inputs(&t, .{ .source = .root, .root = half }, null)));
+    try testing.expectError(error.EmsdkRootInvalid, plan(a, testing.io, try inputs(&t, .{ .root = half }, null)));
+    try testing.expectError(error.InheritedEmsdkMissing, plan(a, testing.io, try inputs(&t, .{ .source = .inherited }, half)));
+    // The managed chain skips it rather than handing the build a broken EM_CONFIG.
+    try testing.expect(try plan(a, testing.io, try inputs(&t, .{}, half)) == .install);
+    try Fake.touch(testing.io, a, &.{ half, em_config_name });
+    try testing.expectEqual(Source.inherited, (try plan(a, testing.io, try inputs(&t, .{}, half))).ready.source);
+}
+
+test "package mode re-activates a tree activated for another version, or by someone else" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const a = t.arena.allocator();
+    const target = try t.path(&.{"target"});
+    const pkg = try t.path(&.{ "target", "zig-pkg", "h" });
+    try Fake.touch(testing.io, a, &.{ pkg, launcher_name });
+    try Fake.touch(testing.io, a, &.{ pkg, "emsdk.py" });
+    // Activated with no record of ours (the CLI 2.x core activates in place too).
+    try fakeActivated(a, pkg);
+    const cache = try t.path(&.{"cache"});
+    var fake: Fake = .{};
+    _ = try activatePackages(a, testing.io, fake.runner(), target, cache, "4.0.8", false, null);
+    try testing.expectEqual(@as(usize, 1), fake.installs);
+    // Recorded 4.0.8: the same version is current, no work.
+    _ = try activatePackages(a, testing.io, fake.runner(), target, cache, "4.0.8", false, null);
+    try testing.expectEqual(@as(usize, 1), fake.installs);
+    // emsdk.version changed to 4.0.9: re-activated, and recorded.
+    _ = try activatePackages(a, testing.io, fake.runner(), target, cache, default_version, false, null);
+    try testing.expectEqual(@as(usize, 2), fake.installs);
+    const recorded = try std.Io.Dir.cwd().readFileAlloc(testing.io, try t.path(&.{ "target", "zig-pkg", "h", package_marker_name }), a, .limited(64));
+    try testing.expectEqualStrings(default_version, recorded);
+    // Offline, a version change cannot be installed: a clear refusal.
+    try testing.expectError(error.EmsdkNotInstalledOffline, activatePackages(a, testing.io, fake.runner(), target, cache, "4.0.8", true, null));
+}
+
+test "the launcher and the build get EMSDK_PYTHON on Windows only" {
+    const a = testing.allocator;
+    const win = try launcherEnv(a, "python3", true);
+    defer a.free(win);
+    try testing.expectEqual(@as(usize, 1), win.len);
+    try testing.expectEqualStrings("EMSDK_PYTHON", win[0].name);
+    try testing.expectEqualStrings("python3", win[0].value);
+    try testing.expectEqual(@as(usize, 0), (try launcherEnv(a, "python3", false)).len);
+    try testing.expectEqual(@as(usize, 0), (try launcherEnv(a, null, true)).len);
+    // Through a real managed install: the launcher step receives it on Windows.
+    var t = try Tmp.init();
+    defer t.deinit();
+    var fake: Fake = .{};
+    _ = try ensureManaged(t.arena.allocator(), testing.io, fake.runner(), try t.path(&.{"cache"}), default_version, false, "python3");
+    if (is_windows) try testing.expectEqualStrings("python3", fake.launcher_python.?) else try testing.expectEqual(@as(?[]const u8, null), fake.launcher_python);
+}
+
+test "checkPython accepts only Python 3" {
+    var fake: Fake = .{ .python_major = "2" };
+    const got = checkPython(testing.allocator, testing.io, fake.runner());
+    try testing.expect(got == .python2);
+    try testing.expectEqual(@as(?[]const u8, null), findPython(testing.allocator, testing.io, fake.runner()));
+    fake.python_major = "3";
+    try testing.expect(checkPython(testing.allocator, testing.io, fake.runner()) == .found);
 }
 
 test "findPython reports a missing interpreter" {

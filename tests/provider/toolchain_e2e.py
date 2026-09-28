@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -374,7 +375,7 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
     port = free_port()
     log = (base / "watch.log").open("w+")
     kwargs = {"start_new_session": True} if not windows else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    session = subprocess.Popen([cli, "run", "--platform=wasm", "--watch", "--progress=off", "--", f"--port={port}", "--no-open"],
+    session = subprocess.Popen([cli, "run", "--platform=wasm", "--watch", "--scene=intro", "--progress=off", "--", f"--port={port}", "--no-open"],
                                cwd=project, env=dict(env, LABELLE_HOME=str(home)), stdout=log, stderr=log, **kwargs)
 
     def generation():
@@ -391,6 +392,21 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
             assert http(port, "/data.txt") == b"one"
             page = http(port, "/").decode()
             assert "__labelle_livereload" in page and 'data-wasm-bytes="8"' in page, page
+            # Seeded with the generation it was served from (no first-poll baseline).
+            assert 'var current = "0";' in page, page
+            # run.env reaches the page ahead of every page script, and its
+            # preRun step copies it into Emscripten's ENV (what getenv reads).
+            assert 'window.LABELLE_RUN_ENV = {"LABELLE_SCENE":"intro"};' in page, page
+            assert page.index("LABELLE_RUN_ENV") < page.index("LabelleLoader"), page
+            node = shutil.which("node")
+            if node:
+                start = page.index("<script>", page.index("<head")) + len("<script>")
+                script = page[start:page.index("</script>", start)]
+                probe = ("const vm=require('vm');const ctx={window:{}};vm.createContext(ctx);"
+                         "vm.runInContext(process.argv[1],ctx);ctx.ENV={};"
+                         "for(const f of ctx.window.Module.preRun)f();"
+                         "process.exit(ctx.ENV.LABELLE_SCENE==='intro'?0:1);")
+                assert subprocess.run([node, "-e", probe, "--", script]).returncode == 0, script
             # A successful rebuild publishes, then the generation advances.
             (project / "assets" / "data.txt").write_text("two")
             wait_for("generation 1", lambda: generation() == "1")

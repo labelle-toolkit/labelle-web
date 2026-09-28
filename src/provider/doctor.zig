@@ -32,16 +32,20 @@ pub const Capability = struct {
 };
 
 pub fn checkPython(a: std.mem.Allocator, io: std.Io, runner: emsdk.Runner) Item {
-    const found = emsdk.findPython(a, io, runner);
+    const check = emsdk.checkPython(a, io, runner);
     return .{
         .id = "python",
         .name = "Python (wasm: emsdk + emcc)",
-        .ok = found != null,
+        .ok = check == .found,
         .fixable = true,
         .size_mb = 25,
         .action = "labelle install python",
-        .detail = if (found) |cmd| std.fmt.allocPrint(a, "`{s}` on PATH", .{cmd}) catch cmd else null,
-        .hint = if (found == null) "run `labelle install python` (managed, ~25 MB) or install Python 3 and put `python3` on PATH" else null,
+        .detail = switch (check) {
+            .found => |cmd| std.fmt.allocPrint(a, "`{s}` on PATH (Python 3)", .{cmd}) catch cmd,
+            .python2 => |cmd| std.fmt.allocPrint(a, "`{s}` is Python 2", .{cmd}) catch cmd,
+            .missing => null,
+        },
+        .hint = if (check != .found) "run `labelle install python` (managed, ~25 MB) or install Python 3 and put `python3` on PATH" else null,
     };
 }
 

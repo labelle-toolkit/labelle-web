@@ -1,6 +1,6 @@
 //! Vendored verbatim from labelle-cli v2.1.0 (ffce35f) src/cli/provider_contract.zig:
-//! the provider wire 1.0.0-1.3.0 decoder. Re-vendor on a contract bump; the only
-//! local edit is the watch-test import path below.
+//! the provider wire 1.0.0-1.3.0 decoder. Re-vendor on a contract bump; the local
+//! edits are the watch-test import path and 1.3.x patch acceptance in `supported`.
 //! Provider contract v1. Pure validation; does not resolve or execute packages.
 const std = @import("std");
 
@@ -83,7 +83,11 @@ fn supported(wire_version: []const u8) bool {
     for (supported_versions) |candidate| {
         if (std.mem.eql(u8, wire_version, candidate)) return true;
     }
-    return false;
+    // labelle-web local edit: a patch of the newest minor is additive within
+    // it (no new keys), so the manifest's `>=1.3.0 <1.4.0` range may receive
+    // 1.3.x; the strict key checks below still reject unknown fields.
+    const wire = std.SemanticVersion.parse(wire_version) catch return false;
+    return wire.major == 1 and wire.minor == 3 and wire.pre == null and wire.build == null;
 }
 pub const context_env = "LABELLE_CONTEXT";
 pub const Step = enum { generate, build, bundle, run };

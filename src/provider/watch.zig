@@ -26,6 +26,8 @@ pub const State = struct {
     version: std.atomic.Value(u64) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     session: ?Session = null,
+    /// `serve.runEnvScript`: the `labelle run` options for served pages.
+    run_env_script: ?[]const u8 = null,
 };
 
 /// The generation number in `path`: ASCII decimal digits and an optional

@@ -123,7 +123,8 @@ The server hides this file; exports omit it.
 ## CLI provider
 
 Requires Zig 0.16.0 and labelle-cli 2.1.0 or newer: the manifest admits
-exactly provider contract 1.3 (`command_contract = ">=1.3.0 <1.4.0"`), whose
+provider contract 1.3.x (`command_contract = ">=1.3.0 <1.4.0"`; a patch wire
+adds no keys, and the decoder still rejects unknown fields), whose
 `cache_dir`, `env_file` and `run.watch` it uses. Add this package explicitly
 to `project.labelle`'s `.plugins`, using a pinned release or commit (a
 `local:/absolute/path/to/labelle-web` checkout works too). The dependency name
@@ -166,18 +167,25 @@ it exists, so every backend shares one emsdk.
 
 Which emsdk, by settings `emsdk.source`:
 
-1. `managed` (default): an inherited `EMSDK` whose `upstream/emscripten/emcc`
-   exists is passed through untouched; otherwise `emsdk.root`; otherwise the
+1. `managed` (default): an inherited `EMSDK` that is an activated emsdk
+   (both `upstream/emscripten/emcc` and the `.emscripten` config exist) is
+   passed through untouched; otherwise `emsdk.root`; otherwise the
    provider-managed install, fetched on first use: `git clone --depth 1
    --branch <version>` of emscripten-core/emsdk, the pinned commit verified
    (4.0.9 is `3bcf1dcd`; another version is trusted by tag), then `emsdk
    install` and `emsdk activate`.
 2. `inherited`: only the inherited `EMSDK`; `root`: only `emsdk.root`. Either
-   fails instead of falling back.
+   fails instead of falling back, including when the emsdk has emcc but no
+   `.emscripten` (an interrupted activation: run `emsdk activate`).
 3. `package`: the emsdk the backends' Zig dependency fetched into
    `<target>/zig-pkg/` is activated in place after generation, every copy of
    it (a graph holding two emsdk hashes builds with either), and the one the
    target's `build.zig.zon` names is contributed from the compile onward.
+   The provider records the version it activated in each tree
+   (`.labelle-web-activated`); a tree activated for another `emsdk.version`,
+   or by someone else (CLI 2.x activates one copy itself), is re-activated for
+   the requested version (`emsdk install` adds it, `emsdk activate` switches
+   to it). Offline, that re-activation is refused.
 
 The managed install lives in the provider's cache (the CLI's `cache_dir`,
 `<LABELLE_HOME>/providers/<provider id>/`), shared by every project that pins
@@ -195,9 +203,12 @@ version; a cached one is used without network. The old CLI cache
 (`~/.labelle/emsdk/`) is neither migrated nor deleted; remove it yourself once
 no CLI 2.x project needs it.
 
-emsdk and emcc need Python 3 on `PATH` (`python3`; `python` on Windows). If
-none is found the hooks fail with the fix: `labelle install python` (the CLI's
-managed interpreter) or a system Python 3.
+emsdk and emcc need Python 3 on `PATH` (`python3`; `python`, then `python3`,
+on Windows). The provider runs the candidate and accepts only Python 3; a
+Python 2, or none, fails the hooks with the fix: `labelle install python` (the
+CLI's managed interpreter) or a system Python 3. On Windows the verified
+command is also passed as `EMSDK_PYTHON` to `emsdk.bat` and contributed to the
+build, so `emcc.bat` runs the same interpreter.
 
 `labelle web doctor` reports both requirements without installing anything and
 exits non-zero only when one is missing; `labelle doctor` runs it after the core
@@ -214,7 +225,9 @@ successful build (every hook included) into a fresh directory, switches
 `run.watch.output_dir` to it, then advances `run.watch.generation_file`. The
 server serves only `output_dir` (resolved afresh for each request, never the
 staging tree), polls the generation file and, when it changes, open pages
-reload through the injected client polling `/__labelle_livereload`. A failed
+reload through the injected client polling `/__labelle_livereload`. Each page
+is served with the generation it came from embedded in that client, so a
+build published between serving the page and its first poll still reloads it. A failed
 rebuild publishes nothing, so the last good build keeps being served. SIGTERM or
 Ctrl+C stops the server with status 0.
 
@@ -230,6 +243,17 @@ adds `.nojekyll`. ZIP archives contain the final staged files. The writer suppor
 (up to 65,535 entries and a 4 GiB archive); larger archives return `Zip64Required`.
 The `serve` hook reads `--port=N` and `--no-open` from the arguments after
 `labelle run ... --`.
+
+`labelle run` options (`--scene`, `--profile`, `--screenshot`, `--after`)
+reach the `serve` hook as `run.env` (`LABELLE_SCENE`, ...). A browser game
+has no process environment, so every served HTML page gets them in a script
+placed first in `<head>`: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
+plus a `Module.preRun` step that copies them into Emscripten's `ENV` before
+`main`. The game's `getenv` then sees them as on desktop; the engine's
+`requestedScene()` reads `LABELLE_SCENE` through `getenv`. The script extends
+an existing `Module` (or creates one), which classic Emscripten glue and
+`LabelleLoader.install(window.Module || {})` both keep. Custom pages may also
+read `window.LABELLE_RUN_ENV` directly.
 
 Project `web/` resources are copied alongside the selected page. Root filenames
 `game.js`, `game.wasm`, `game.data`, `.labelle-export`, `labelle-loader.js`, `labelle-logo.png` and
