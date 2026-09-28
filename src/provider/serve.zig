@@ -136,7 +136,7 @@ pub fn serveAndOpen(
     };
     // A deadline without its thread would serve forever: fail instead.
     var deadline_fired: std.atomic.Value(bool) = .init(false);
-    const deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop, &deadline_fired }) else null;
+    var deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop, &deadline_fired }) else null;
     defer if (deadline) |t| {
         wstate.stop.store(true, .release);
         t.join();
@@ -166,6 +166,14 @@ pub fn serveAndOpen(
 
     serveLoop(io, allocator, &server, web_dir, project_web_dir, watch_state, &cancel_requested);
     std.debug.print("\nlabelle-web: stopping server\n", .{});
+    // Join the deadline before reading `fired`: it sets it only after it
+    // claimed the stop itself, so a stop a signal asked for first, even in
+    // the deadline's last tick, is never reported as a timeout.
+    if (deadline) |t| {
+        wstate.stop.store(true, .release);
+        t.join();
+        deadline = null;
+    }
     return if (deadline_fired.load(.acquire)) .timed_out else .stopped;
 }
 
