@@ -1,4 +1,4 @@
-//! CLI provider entry point (provider contract 1.3.0). One tool serves every
+//! CLI provider entry point (provider contract 1.3.x to 1.5.x). One tool serves every
 //! command and hook of `plugin.labelle`:
 //!
 //! - hooks: `toolchain` (before generate) and `toolchain-package` (after
@@ -34,6 +34,10 @@ const Options = struct {
     run_env: []const server.RunEnv = &.{},
     /// `run.timeout_ms` (`labelle run --timeout`): stop serving then, exit 0.
     timeout_ms: ?u64 = null,
+    /// `run.outcome_file` (wire 1.5.0+): where a serve the deadline ended
+    /// reports `timeout`, so the CLI skips the `after run` hooks (cli#473).
+    /// Null below wire 1.5 and outside the run replacement.
+    outcome_file: ?[]const u8 = null,
     /// Export: the emsdk's `wasm-opt`, for when PATH has none.
     wasm_opt: ?[]const u8 = null,
 };
@@ -72,7 +76,8 @@ fn execute(init: std.process.Init) !void {
     const bytes = try cwd.readFileAlloc(io, context_path, a, .limited(1024 * 1024));
     const parsed = try contract.parseContext(a, bytes, true);
     const ctx = parsed.value;
-    // The manifest admits exactly 1.3.x: `cache_dir`, `env_file`, `run.watch`.
+    // The manifest admits 1.3.x (`cache_dir`, `env_file`, `run.watch`),
+    // 1.4.x (`final_step`, decoded, unused) and 1.5.x (`run.outcome_file`).
     if (!wireAccepted(ctx.contract_version)) return error.UnsupportedContract;
     const project = ctx.project_dir.?;
     const settings = if (ctx.config_file) |path|
@@ -115,6 +120,7 @@ fn execute(init: std.process.Init) !void {
             for (run.env, page_env) |from, *to| to.* = .{ .name = from.name, .value = from.value };
             opts.run_env = page_env;
             opts.timeout_ms = run.timeout_ms;
+            opts.outcome_file = run.outcome_file;
             if (run.watch) |session| return serveSession(init, settings, opts, .{ .generation_file = session.generation_file, .output_dir = session.output_dir });
             return webAction(init, ctx, settings, opts, .serve);
         }
@@ -143,10 +149,22 @@ fn execute(init: std.process.Init) !void {
     return error.UnknownCommand;
 }
 
-/// The wires `command_contract = ">=1.3.0 <1.4.0"` admits: 1.3.x, stable.
+/// The wires `command_contract = ">=1.3.0 <1.6.0"` admits: 1.3.x, 1.4.x
+/// and 1.5.x, stable.
 fn wireAccepted(wire_version: []const u8) bool {
     const wire = std.SemanticVersion.parse(wire_version) catch return false;
-    return wire.major == 1 and wire.minor == 3 and wire.pre == null and wire.build == null;
+    return wire.major == 1 and wire.minor >= 3 and wire.minor <= 5 and wire.pre == null and wire.build == null;
+}
+
+/// Tell the CLI how a `run` replacement's serve ended (contract §2 "Run
+/// outcome"): a serve the `--timeout` deadline stopped writes `timeout` to
+/// `run.outcome_file`, so the `after run` hooks are skipped as after the
+/// CLI's own watchdog. Nothing is written for any other stop, or when the
+/// wire has no outcome file (below 1.5: the exit status alone is the outcome).
+fn reportEnding(io: std.Io, ending: server.Ending, outcome_file: ?[]const u8) !void {
+    if (ending != .timed_out) return;
+    const path = outcome_file orelse return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "timeout\n" });
 }
 
 fn is(x: []const u8, y: []const u8) bool {
@@ -266,7 +284,8 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try checkRuntime(io, web);
     try exporter.validateBuildTree(io, std.Io.Dir.cwd(), web);
     const port = opts.port orelse settings.port;
-    try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms);
+    const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms);
+    try reportEnding(io, ending, opts.outcome_file);
 }
 
 fn checkRuntime(io: std.Io, web: []const u8) !void {
@@ -323,7 +342,8 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
                 // Serve the stamped copy, never the original placeholder-bearing source.
-                try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms);
+                const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms);
+                try reportEnding(io, ending, opts.outcome_file);
             }
         },
     }
@@ -391,9 +411,30 @@ test "run.args and command options: serve and export options stay apart" {
     try std.testing.expectEqual(exporter.Platform.itch, export_opts.platform.?);
 }
 
-test "the tool accepts every 1.3.x wire and nothing else, and still decodes strictly" {
-    for ([_][]const u8{ "1.3.0", "1.3.7" }) |wire| try std.testing.expect(wireAccepted(wire));
-    for ([_][]const u8{ "1.4.0", "1.2.0", "2.3.0", "1.3.1-rc.1", "x" }) |wire| try std.testing.expect(!wireAccepted(wire));
+test "reportEnding: only a deadline stop with an outcome file writes `timeout`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "outcome" });
+    defer a.free(path);
+    // A wire below 1.5 has no outcome file: nothing to write, no error.
+    try reportEnding(io, .timed_out, null);
+    // Any other stop reports nothing: the exit status alone decides.
+    try reportEnding(io, .stopped, path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
+    // The deadline: `timeout`, exactly what the CLI parses.
+    try reportEnding(io, .timed_out, path);
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64));
+    defer a.free(written);
+    try std.testing.expectEqualStrings("timeout\n", written);
+}
+
+test "the tool accepts every 1.3.x, 1.4.x and 1.5.x wire and nothing else, and still decodes strictly" {
+    for ([_][]const u8{ "1.3.0", "1.3.7", "1.4.0", "1.4.2", "1.5.0", "1.5.3" }) |wire| try std.testing.expect(wireAccepted(wire));
+    for ([_][]const u8{ "1.6.0", "1.2.0", "2.3.0", "1.3.1-rc.1", "1.5.0-rc.1", "x" }) |wire| try std.testing.expect(!wireAccepted(wire));
     const a = std.testing.allocator;
     const ctx = if (@import("builtin").os.tag == .windows)
         \\{"contract_version":"VER","invocation":{"kind":"command","id":"doctor","step":null,"phase":null},"package_dir":"C:\\p","project_dir":"C:\\g","target":"wasm","lock_file":"C:\\g\\labelle.lock","config_file":null,"output_dir":"C:\\o","zig_executable":"C:\\z","optimize":"Debug","progress":"off","target_dir":null,"cache_dir":"C:\\c","env_file":null EXTRA}
@@ -412,7 +453,7 @@ test "the tool accepts every 1.3.x wire and nothing else, and still decodes stri
         defer a.free(extra);
         try std.testing.expectError(error.UnknownField, contract.parseContext(a, extra, true));
     }
-    const newer = try std.mem.replaceOwned(u8, a, ctx, "VER", "1.4.0");
+    const newer = try std.mem.replaceOwned(u8, a, ctx, "VER", "1.6.0");
     defer a.free(newer);
     const newer_plain = try std.mem.replaceOwned(u8, a, newer, " EXTRA", "");
     defer a.free(newer_plain);

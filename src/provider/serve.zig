@@ -86,6 +86,9 @@ fn serveLoop(
 /// poller thread follows `session.generation_file`, and connected browsers
 /// reload through an injected client polling `/__labelle_livereload`.
 /// Pass `null` for a plain static serve.
+///
+/// Returns how the serve ended: `.timed_out` when the `timeout_ms`
+/// deadline stopped it, `.stopped` for any other stop request.
 pub fn serveAndOpen(
     allocator: std.mem.Allocator,
     web_dir: []const u8,
@@ -95,7 +98,7 @@ pub fn serveAndOpen(
     session: ?watch.Session,
     run_env: []const RunEnv,
     timeout_ms: ?u64,
-) !void {
+) !Ending {
     const io = config.globalIo();
 
     // The session starts at the generation the CLI published before it
@@ -132,7 +135,8 @@ pub fn serveAndOpen(
         t.join();
     };
     // A deadline without its thread would serve forever: fail instead.
-    const deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop }) else null;
+    var deadline_fired: std.atomic.Value(bool) = .init(false);
+    var deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop, &deadline_fired }) else null;
     defer if (deadline) |t| {
         wstate.stop.store(true, .release);
         t.join();
@@ -162,7 +166,24 @@ pub fn serveAndOpen(
 
     serveLoop(io, allocator, &server, web_dir, project_web_dir, watch_state, &cancel_requested);
     std.debug.print("\nlabelle-web: stopping server\n", .{});
+    // Join the deadline before reading `fired`: it sets it only after it
+    // claimed the stop itself, so a stop a signal asked for first, even in
+    // the deadline's last tick, is never reported as a timeout.
+    if (deadline) |t| {
+        wstate.stop.store(true, .release);
+        t.join();
+        deadline = null;
+    }
+    return if (deadline_fired.load(.acquire)) .timed_out else .stopped;
 }
+
+/// How `serveAndOpen` ended.
+pub const Ending = enum {
+    /// A stop request (Ctrl+C / SIGTERM) ended the serve.
+    stopped,
+    /// The `labelle run --timeout` deadline (`run.timeout_ms`) ended it.
+    timed_out,
+};
 
 /// Best-effort browser launch. A failure here is non-fatal — the
 /// server is already up and the URL is printed; the user can open it
@@ -269,8 +290,9 @@ test "serveAndOpen: a run timeout stops the server cleanly at the deadline" {
     defer cancel_requested.store(false, .release);
     cancel_requested.store(false, .release);
     const started = std.Io.Clock.Timestamp.now(io, .awake);
-    // Returns (no error) only because the deadline asked for the stop.
-    try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300);
+    // Returns (no error) only because the deadline asked for the stop, and
+    // says so.
+    try std.testing.expectEqual(Ending.timed_out, try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300));
     const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
     try std.testing.expect(cancel_requested.load(.acquire));
     try std.testing.expect(elapsed >= 300);
