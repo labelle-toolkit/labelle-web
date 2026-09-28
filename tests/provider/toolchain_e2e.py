@@ -217,7 +217,7 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
             (project / "providers").mkdir()
             (project / "providers" / "web.json").write_text(json.dumps(settings))
             config = ', .provider_config = .{ .{ .package = "web", .file = "providers/web.json" } }'
-        dep = f'.{{ .name = "web", .repo = "local:{repo.as_posix()}", .version = "0.3.0" }}'
+        dep = f'.{{ .name = "web", .repo = "local:{repo.as_posix()}", .version = "0.3.1" }}'
         (project / "project.labelle").write_text(
             f'.{{ .name = "game", .zig_version = "{version}", .plugins = .{{ {dep} }}{config} }}')
         return project

@@ -79,7 +79,7 @@ if options.mode == "managed":
     assert result.returncode == 0, "labelle init failed"
     config = project / "project.labelle"
     text = config.read_text(encoding="utf-8")
-    dep = '.{ .name = "web", .repo = "local:%s", .version = "0.3.0" }' % repo.as_posix()
+    dep = '.{ .name = "web", .repo = "local:%s", .version = "0.3.1" }' % repo.as_posix()
     text, count = re.subn(r"\.plugins\s*=\s*\.\{", ".plugins = .{ " + dep + ",", text, count=1)
     assert count == 1, "project.labelle has no .plugins list"
     config.write_text(text, encoding="utf-8")

@@ -254,8 +254,10 @@ server stops at the deadline and exits 0, as on Ctrl+C.
 `labelle run` options (`--scene`, `--profile`, `--screenshot`, `--after`)
 reach the `serve` hook as `run.env` (`LABELLE_SCENE`, ...). A browser game
 has no process environment, so every served HTML page gets them in a script
-placed right after the first real `<head>` tag (comments are skipped; without
-one, after `<body>`, else at the start), with every `<` in the values escaped: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
+placed ahead of every page script: right after the first real `<head>` tag,
+the first `<script>` or `<body>` tag, whichever comes first (comments are
+skipped; with none of them, after the `<!doctype>`, else at the start), with
+every `<` in the values escaped: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
 plus a `Module.preRun` step that copies them into Emscripten's `ENV` before
 `main`. The game's `getenv` then sees them as on desktop; the engine's
 `requestedScene()` reads `LABELLE_SCENE` through `getenv`. The script extends

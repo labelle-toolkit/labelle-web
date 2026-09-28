@@ -668,20 +668,43 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
     return std.mem.concat(allocator, u8, &.{ html, script });
 }
 
-/// Splice `script` right after the opening `<head ...>` tag, ahead of every
-/// page script; else after `<body ...>`; else at the start. The tags are
-/// found by `tagEnd`, which skips comments.
+/// Splice `script` ahead of every page script: right after the opening
+/// `<head ...>` tag, the first page `<script>` or the opening `<body ...>`
+/// tag, whichever comes first. So a page with no real `<head>` and a
+/// synchronous script ahead of `<body>` still sees the options before it
+/// runs. With none of them, it goes after the `<!doctype ...>` (never ahead
+/// of it, which would put the page in quirks mode), else at the start. The
+/// tags are found by `findTag`, which skips comments.
 fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
-    const at = tagEnd(html, "head") orelse tagEnd(html, "body") orelse 0;
-    return std.mem.concat(allocator, u8, &.{ html[0..at], script, html[at..] });
+    var at: ?usize = null;
+    if (findTag(html, "head")) |t| at = t.end;
+    if (findTag(html, "script")) |t| at = @min(at orelse t.start, t.start);
+    if (findTag(html, "body")) |t| at = @min(at orelse t.end, t.end);
+    const pos = at orelse doctypeEnd(html);
+    return std.mem.concat(allocator, u8, &.{ html[0..pos], script, html[pos..] });
 }
 
-/// The index just past the `>` of the first real `<name ...>` start tag:
-/// a small scan over the markup that skips `<!-- ... -->` comments (an
-/// unterminated one hides the rest of the page), matches the name
-/// case-insensitively and whole (`<header>` is not `<head>`), and allows
-/// attributes. Quoted attribute values may contain `>`.
+/// The index just past a leading `<!doctype ...>` (after optional
+/// whitespace), else 0.
+fn doctypeEnd(html: []const u8) usize {
+    const lead = html.len - std.mem.trimStart(u8, html, " \t\r\n").len;
+    const rest = html[lead..];
+    if (rest.len < "<!doctype".len or !std.ascii.eqlIgnoreCase(rest[0.."<!doctype".len], "<!doctype")) return 0;
+    const gt = std.mem.indexOfScalarPos(u8, html, lead, '>') orelse return 0;
+    return gt + 1;
+}
+
+/// The index just past the `>` of the first real `<name ...>` start tag.
 fn tagEnd(html: []const u8, name: []const u8) ?usize {
+    return if (findTag(html, name)) |t| t.end else null;
+}
+
+/// The first real `<name ...>` start tag: `start` at its `<`, `end` just
+/// past its `>`. A small scan over the markup that skips `<!-- ... -->`
+/// comments (an unterminated one hides the rest of the page), matches the
+/// name case-insensitively and whole (`<header>` is not `<head>`), and
+/// allows attributes. Quoted attribute values may contain `>`.
+fn findTag(html: []const u8, name: []const u8) ?struct { start: usize, end: usize } {
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
         if (std.mem.startsWith(u8, html[lt..], "<!--")) {
@@ -702,7 +725,7 @@ fn tagEnd(html: []const u8, name: []const u8) ?usize {
                     if (c == q) quote = null;
                 } else if (c == '"' or c == '\'') {
                     quote = c;
-                } else if (c == '>') return j + 1;
+                } else if (c == '>') return .{ .start = lt, .end = j + 1 };
             }
             return null;
         }
@@ -1141,6 +1164,17 @@ test "injectFirst: after <head>, else <body>, else at the start; never inside <h
         .{ "<html><head><title>t</title></head></html>", "<html><head>S<title>t</title></head></html>" },
         .{ "<html><body class=x><header>h</header></body></html>", "<html><body class=x>S<header>h</header></body></html>" },
         .{ "<p>fragment</p>", "S<p>fragment</p>" },
+        // No <head>: before the first script, even one ahead of <body>.
+        .{ "<!DOCTYPE html><html><script>var Module={};</script><body><canvas></canvas></body></html>", "<!DOCTYPE html><html>S<script>var Module={};</script><body><canvas></canvas></body></html>" },
+        .{ "<!doctype html><SCRIPT src=early.js></SCRIPT><body></body>", "<!doctype html>S<SCRIPT src=early.js></SCRIPT><body></body>" },
+        .{ "<!-- <script> --><html><body><script>x</script></body></html>", "<!-- <script> --><html><body>S<script>x</script></body></html>" },
+        .{ "<html><scripts></scripts><body>b</body></html>", "<html><scripts></scripts><body>Sb</body></html>" },
+        // Neither head, script nor body: after the doctype, never ahead of it.
+        .{ "<!DOCTYPE html>\n<p>x</p>", "<!DOCTYPE html>S\n<p>x</p>" },
+        .{ "  <!doctype html><p>x</p>", "  <!doctype html>S<p>x</p>" },
+        // A script ahead of a late <head> runs before it: go first.
+        .{ "<script>a</script><head><title>t</title></head>", "S<script>a</script><head><title>t</title></head>" },
+        .{ "<html><head><script>a</script></head><script>b</script>", "<html><head>S<script>a</script></head><script>b</script>" },
     }) |case| {
         const got = try injectFirst(alloc, case[0], "S");
         defer alloc.free(got);

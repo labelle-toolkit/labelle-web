@@ -492,29 +492,35 @@ pub fn packagesReady(a: std.mem.Allocator, io: std.Io, target_dir: []const u8, v
 pub const default_backend = "bgfx";
 
 /// The backend `project.labelle` selects (`.backend = .<name>`), else
-/// `default_backend`. A line scan: `//` comments are ignored.
+/// `default_backend`. The file is parsed as ZON, the way the CLI reads it,
+/// so any whitespace or comments around the field are fine and only the
+/// top-level `.backend` counts (not one nested in, say, a plugin entry).
+/// An unreadable or malformed file yields the default.
 pub fn projectBackend(a: std.mem.Allocator, io: std.Io, project_dir: []const u8) ![]const u8 {
     const path = try std.fs.path.join(a, &.{ project_dir, "project.labelle" });
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return default_backend;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = raw[0 .. std.mem.indexOf(u8, raw, "//") orelse raw.len];
-        var at: usize = 0;
-        while (std.mem.indexOfPos(u8, line, at, ".backend")) |i| {
-            at = i + ".backend".len;
-            var j = at;
-            while (j < line.len and line[j] == ' ') j += 1;
-            if (j >= line.len or line[j] != '=') continue;
-            j += 1;
-            while (j < line.len and line[j] == ' ') j += 1;
-            if (j >= line.len or line[j] != '.') continue;
-            j += 1;
-            const start = j;
-            while (j < line.len and (std.ascii.isAlphanumeric(line[j]) or line[j] == '_')) j += 1;
-            if (j > start) return line[start..j];
-        }
+    return backendFromZon(a, try a.dupeZ(u8, text)) orelse default_backend;
+}
+
+/// The top-level `.backend` enum literal of a ZON struct literal, if any.
+/// `a` should be an arena: the parse trees are not freed.
+fn backendFromZon(a: std.mem.Allocator, source: [:0]const u8) ?[]const u8 {
+    const tree = std.zig.Ast.parse(a, source, .zon) catch return null;
+    if (tree.errors.len != 0) return null;
+    const zoir = std.zig.ZonGen.generate(a, tree, .{ .parse_str_lits = false }) catch return null;
+    if (zoir.hasCompileErrors()) return null;
+    const fields = switch (std.zig.Zoir.Node.Index.root.get(zoir)) {
+        .struct_literal => |s| s,
+        else => return null,
+    };
+    for (fields.names, 0..) |name, i| {
+        if (!std.mem.eql(u8, name.get(zoir), "backend")) continue;
+        return switch (fields.vals.at(@intCast(i)).get(zoir)) {
+            .enum_literal => |lit| a.dupe(u8, lit.get(zoir)) catch null,
+            else => null,
+        };
     }
-    return default_backend;
+    return null;
 }
 
 /// `<project>/.labelle/<backend>_<target>`: the generated tree a build of
@@ -536,6 +542,27 @@ test "projectBackend reads .backend, ignoring comments, else the default" {
     try testing.expectEqualStrings("sokol", try projectBackend(a, testing.io, project));
     const dir = try selectedTargetDir(a, testing.io, project, "wasm");
     try testing.expectEqualStrings(try t.path(&.{ "p", ".labelle", "sokol_wasm" }), dir);
+}
+
+test "projectBackend tolerates tabs, line breaks and comments around the field" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const a = t.arena.allocator();
+    const project = try t.path(&.{"p"});
+    try std.Io.Dir.cwd().createDirPath(testing.io, project);
+    const file = try t.path(&.{ "p", "project.labelle" });
+    for ([_][2][]const u8{
+        .{ ".{\n\t.name\t=\t\"demo\",\n\t.backend\t=\t.raylib,\n}\n", "raylib" },
+        .{ ".{ .name = \"demo\", .backend\n    =\n    .sokol }", "sokol" },
+        .{ ".{\n    .backend = // the web backend\n        .raylib, // trailing\n}", "raylib" },
+        .{ ".{ .backend /* no block comments in ZON */ = .raylib }", default_backend },
+        .{ ".{ .plugins = .{ .{ .name = \"x\", .backend = .raylib } }, .name = \"demo\" }", default_backend },
+        .{ ".{ .plugins = .{ .{ .backend = .raylib } }, .backend = .sokol }", "sokol" },
+        .{ ".{ .backend = \"raylib\" }", default_backend },
+    }) |case| {
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = case[0] });
+        try testing.expectEqualStrings(case[1], try projectBackend(a, testing.io, project));
+    }
 }
 
 /// The `emsdk` dependency hash in the target's `build.zig.zon`, if any.
