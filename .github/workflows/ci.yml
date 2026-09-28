@@ -131,9 +131,13 @@ jobs:
         working-directory: tests/shell
 
   provider:
-    name: Provider commands and hooks (real CLI)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Provider commands and hooks (real CLI 2.1.0, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -144,14 +148,62 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # labelle-cli v2.1.0: provider contract 1.3.0 (cache_dir, env_file,
+      # target_defaults, run.watch).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: c9cc9682781990e6ae69b4b96c44b309045e1b21
+          ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
           path: .test-cli
           persist-credentials: false
       - run: zig build
         working-directory: .test-cli
       - run: zig build install-provider
       - name: Exercise CLI discovery, serving, export and hook contexts
+        shell: bash
         run: python3 tests/provider/e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
+      - name: Toolchain hooks, doctor and browser watch through the pipeline
+        shell: bash
+        run: python3 tests/provider/toolchain_e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
+
+  # The real toolchain bootstrap (RFC labelle-cli#466 §8): a fresh
+  # `labelle init` project builds for wasm with a clean LABELLE_HOME, EMSDK
+  # unset and no emcc on PATH, so the provider itself fetches, verifies and
+  # activates emsdk (~1 GB, deliberately not cached: a cache hit would
+  # skip exactly what this job proves). The managed install is then moved
+  # out of the cache and handed back as an external EMSDK, which must be
+  # passed through without a download.
+  wasm-from-zero:
+    name: wasm from zero (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Zig builds the CLI under test; the project's own Zig is provisioned
+      # by that CLI into the clean LABELLE_HOME.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
+          path: .test-cli
+          persist-credentials: false
+      - run: zig build
+        working-directory: .test-cli
+      - name: Build wasm from zero
+        shell: bash
+        run: python3 tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode managed
+      - name: External EMSDK is passed through without a download
+        shell: bash
+        run: python3 tests/provider/wasm_from_zero.py --cli .test-cli/zig-out/bin/labelle --work "$RUNNER_TEMP/wz" --mode passthrough

@@ -1,16 +1,27 @@
+// labelle-web: the `web` provider (labelle-cli provider contract 1.3).
+// Owns the `wasm` target. `command_contract` admits exactly the 1.3 wire the
+// vendored strict decoder (src/provider/contract.zig) and the tool need:
+// `cache_dir` and `env_file` for the emsdk, `run.watch` for browser watch.
 .{
     .name = "web",
     .manifest_version = 2,
-    .command_contract = ">=1.0.0 <1.2.0",
+    .command_contract = ">=1.3.0 <1.4.0",
     .namespace = "web",
     .targets = .{"wasm"},
+    .target_defaults = .{
+        .{ .target = "wasm", .optimize = .ReleaseSafe },
+    },
     .commands = .{
-        .{ .name = "serve", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Stage and serve a built web game" },
-        .{ .name = "export", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Export a built web game with a sized loading shell" },
+        .{ .name = "serve", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Stage and serve a built web game (--port=N, --no-open, --input=DIR)" },
+        .{ .name = "export", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Export a built web game with a sized loading shell (--output=DIR, --zip, --platform=itch|github-pages)" },
+        .{ .name = "doctor", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Check the wasm toolchain: Python and emsdk (--json)", .needs_project = true },
+        .{ .name = "toolchain", .build_step = "install-provider", .executable = "bin/labelle-web", .help = "Show or install the emsdk: which | install [<version>]", .needs_project = true },
     },
     .hooks = .{
+        .{ .id = "toolchain", .step = .generate, .target = "wasm", .when = .before, .build_step = "install-provider", .executable = "bin/labelle-web" },
+        .{ .id = "toolchain-package", .step = .generate, .target = "wasm", .when = .after, .build_step = "install-provider", .executable = "bin/labelle-web" },
         .{ .id = "shell", .step = .build, .target = "wasm", .when = .after, .build_step = "install-provider", .executable = "bin/labelle-web" },
-        .{ .id = "serve", .step = .run, .target = "wasm", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-web" },
+        .{ .id = "serve", .step = .run, .target = "wasm", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-web", .watch = true },
         .{ .id = "export", .step = .bundle, .target = "wasm", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-web" },
     },
 }

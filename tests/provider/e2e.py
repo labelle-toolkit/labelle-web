@@ -202,7 +202,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     assert (project / 'user-data/keep').read_text() == 'keep'
     # Exercise actual post-build and bundle wire contexts; generic CLI hooks
     # are independently covered in labelle-cli/test/provider_hooks_e2e.py.
-    context = dict(contract_version='1.1.0', invocation=dict(kind='hook', id='shell', step='build', phase='after'), package_dir=str(repo), project_dir=str(project), target='wasm', lock_file=str(project / 'labelle.lock'), config_file=None, output_dir=str(web.parent), zig_executable=zig, optimize='Debug', progress='json')
+    context = dict(contract_version='1.3.0', invocation=dict(kind='hook', id='shell', step='build', phase='after'), package_dir=str(repo), project_dir=str(project), target='wasm', lock_file=str(project / 'labelle.lock'), config_file=None, output_dir=str(web.parent), zig_executable=zig, optimize='Debug', progress='json', target_dir=str(web.parent.parent), cache_dir=str(temp / 'provider-cache'), env_file=None)
     ctxfile = temp / 'context.json'
     def hook(fail=None):
         ctxfile.write_text(json.dumps(context))
@@ -462,8 +462,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
             free_port.bind(('127.0.0.1', 0))
             port = free_port.getsockname()[1]
         serve_config = temp / 'serve-config.json'
-        serve_config.write_text(json.dumps(dict(port=port, open_browser=False)))
-        context.update(invocation=dict(kind='hook', id='serve', step='run', phase='replace'), output_dir=str(web.parent), config_file=str(serve_config))
+        serve_config.write_text(json.dumps(dict(schema_version=1, port=port, open_browser=False)))
+        context.update(invocation=dict(kind='hook', id='serve', step='run', phase='replace'), output_dir=str(web.parent), config_file=str(serve_config), run=dict(env=[], args=[], timeout_ms=None, watch=None))
         ctxfile.write_text(json.dumps(context))
         direct = subprocess.Popen([exe], cwd=project, env=dict(env, LABELLE_CONTEXT=str(ctxfile)), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
