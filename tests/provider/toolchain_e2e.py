@@ -5,7 +5,8 @@ python tests/provider/toolchain_e2e.py --cli /path/to/labelle --zig /path/to/zig
 RFC labelle-cli#466 PR W acceptance, against a CLI built from labelle-cli
 v2.1.0. Hermetic: a fake assembler generates a tiny wasm-shaped build whose
 configure step logs the environment it sees (`configure.log`: optimize,
-EMSDK, EM_CONFIG and the first PATH entry, one line per zig invocation), and
+EMSDK, EM_CONFIG and the first two PATH entries, one line per zig
+invocation), and
 a fake `git` on PATH "clones" a fake emsdk whose `install` creates
 `upstream/emscripten/emcc` and whose `activate` writes `.emscripten`. No
 network, no real emscripten.
@@ -15,6 +16,8 @@ Each check asserts the path taken:
   contribution reaches the fingerprint pass (`labelle generate`, which runs
   no compile) and the compile, with the ReleaseSafe target default;
 - passthrough: an external EMSDK is used and nothing is cloned;
+- every source puts `upstream/emscripten` then `upstream/bin` on PATH, and
+  `labelle bundle` runs the emsdk's `wasm-opt` from there (POSIX);
 - `--progress=json` keeps stdout pure NDJSON;
 - offline with no cached emsdk fails naming the version; offline with it cached succeeds;
 - no Python on PATH fails naming `labelle install python`;
@@ -75,7 +78,9 @@ elif argv and argv[0] == "generate":
         '    const previous = std.Io.Dir.cwd().readFileAlloc(b.graph.io, log_path, b.allocator, .limited(1 << 20)) catch "";\n'
         '    const path_env = env.get("PATH") orelse "";\n'
         '    const head = path_env[0 .. std.mem.indexOfScalar(u8, path_env, std.fs.path.delimiter) orelse path_env.len];\n'
-        '    const line = b.fmt("{s}{s}|{s}|{s}|{s}\\n", .{ previous, @tagName(optimize), env.get("EMSDK") orelse "-", env.get("EM_CONFIG") orelse "-", head });\n'
+        '    const rest = if (head.len < path_env.len) path_env[head.len + 1 ..] else "";\n'
+        '    const second = rest[0 .. std.mem.indexOfScalar(u8, rest, std.fs.path.delimiter) orelse rest.len];\n'
+        '    const line = b.fmt("{s}{s}|{s}|{s}|{s}|{s}\\n", .{ previous, @tagName(optimize), env.get("EMSDK") orelse "-", env.get("EM_CONFIG") orelse "-", head, second });\n'
         '    std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = log_path, .data = line }) catch @panic("configure.log");\n'
         + ('    b.getInstallStep().dependOn(&b.addFail("fixture: broken build").step);\n' if broken else '') +
         '    b.installFile("web/game.wasm", "web/game.wasm");\n'
@@ -142,6 +147,20 @@ elif argv[:2] == ["rev-parse", "HEAD"]:
 else:
     raise SystemExit(f"fake git: unexpected {argv}")
 ''' % COMMIT
+
+
+# binaryen's `wasm-opt` in the fake emsdk's `upstream/bin` (POSIX): logs
+# the name it was spawned as (bare `wasm-opt` = found on PATH) and writes a
+# recognizable wasm to `-o`.
+OPTIMIZED = b"\0asm\1\0\0\0\0\0"
+FAKE_WASM_OPT = r'''import os, sys
+from pathlib import Path
+here = str(Path(sys.argv[1]).resolve().parent)
+on_path = any(p and str(Path(p).resolve()) == here for p in os.environ.get("PATH", "").split(os.pathsep))
+with open(os.environ["FAKE_WASM_OPT_LOG"], "a") as f:
+    f.write(("on PATH" if on_path else "off PATH") + "\n")
+Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(%r)
+''' % OPTIMIZED
 
 
 def wrapper(directory, name, script):
@@ -263,8 +282,26 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
     lines = configure_lines(project)
     assert lines and all(l[1] == str(external) for l in lines), lines
     assert all(l[3] == str(external / "upstream" / "emscripten") for l in lines), lines
+    # binaryen's directory follows emcc's, for the bundle export's wasm-opt.
+    assert all(l[4] == str(external / "upstream" / "bin") for l in lines), lines
     assert clones() == [] and managed_dir(home_a) is None, "an external EMSDK must not download"
     assert (target_of(project) / "zig-out" / "web" / "game.wasm").read_bytes() == WASM
+    # The bundle export runs the emsdk's wasm-opt, found through the
+    # contributed PATH alone (no wasm-opt anywhere else on it).
+    if not windows:
+        (external / "upstream" / "bin").mkdir(parents=True)
+        (tools / "fake_wasm_opt.py").write_text(FAKE_WASM_OPT)
+        optimizer = external / "upstream" / "bin" / "wasm-opt"
+        optimizer.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{tools / "fake_wasm_opt.py"}" "$0" "$@"\n')
+        optimizer.chmod(0o755)
+        wasm_opt_log = base / "wasm-opt.log"
+        result = run(project, "bundle", "--platform=wasm", home=home_a,
+                     extra={"EMSDK": str(external), "FAKE_WASM_OPT_LOG": str(wasm_opt_log)})
+        assert "wasm-opt not found" not in result.stderr, result.stderr
+        # Ran once, with its directory on the export's PATH (the contribution).
+        assert wasm_opt_log.read_text().splitlines() == ["on PATH"], wasm_opt_log.read_text()
+        shipped = [p for p in project.rglob("game.wasm") if p.read_bytes() == OPTIMIZED]
+        assert shipped, "the bundle must ship the optimized wasm"
 
     # ── Managed, from zero: the fingerprint pass sees the contribution ──
     home = base / "home"
@@ -279,6 +316,7 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
     assert len(lines) == 1, lines
     assert lines[0][1] == str(install) and lines[0][2] == str(install / ".emscripten"), lines
     assert lines[0][3] == str(install / "upstream" / "emscripten"), lines
+    assert lines[0][4] == str(install / "upstream" / "bin"), lines
     # The build: pure NDJSON on stdout, ReleaseSafe from the target default,
     # the contribution in the compile, the loading shell stamped.
     result = run(project, "build", "--platform=wasm", home=home, progress="json")
@@ -367,6 +405,7 @@ with tempfile.TemporaryDirectory(prefix="web-030-e2e-") as temp:
     # The fingerprint pass ran before activation: no contribution there.
     assert lines[0][1] == "-", lines
     assert lines[-1][1] == str(pkgs[0]), lines
+    assert lines[-1][3:5] == [str(pkgs[0] / "upstream" / "emscripten"), str(pkgs[0] / "upstream" / "bin")], lines
     assert "emsdk from package" in result.stderr, result.stderr
     assert len(clones()) == before + 1, "package mode never uses the managed install"
     assert emsdk_log.read_text().count("install") >= installs_before + 1

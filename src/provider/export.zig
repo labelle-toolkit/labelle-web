@@ -27,6 +27,9 @@ pub const Options = struct {
     output_dir: []const u8,
     zip: bool = false,
     platform: Platform = .none,
+    /// A `wasm-opt` to run when none is on PATH (the emsdk's
+    /// `upstream/bin` one, `emsdk.wasmOptPath`).
+    wasm_opt_fallback: ?[]const u8 = null,
 };
 
 /// A packaged file and its size before/after optimization. `before` ==
@@ -136,7 +139,7 @@ pub fn packageExport(
     try copyTree(allocator, io, web_dir, opts.output_dir, &files);
 
     // 2. Best-effort wasm-opt -O3 on each .wasm.
-    const wasm_opt_ran = try optimizeWasm(allocator, io, opts.output_dir, &files);
+    const wasm_opt_ran = try optimizeWasm(allocator, io, opts.output_dir, &files, opts.wasm_opt_fallback);
     // Stamp AFTER optimization, so the download total describes shipped bytes.
     try ensureIndexHtml(allocator, io, web_dir, project_web_dir, opts.output_dir, &files);
 
@@ -378,14 +381,18 @@ fn ensureIndexHtml(
 
 /// Best-effort `wasm-opt -O3` over every top-level `.wasm` in
 /// `output_dir`. Returns true if at least one file was optimized.
-/// Missing `wasm-opt` (not on PATH) is not an error — the export just
-/// ships the un-optimized wasm.
+/// `wasm-opt` is looked up on PATH (where the toolchain hooks put the
+/// emsdk's `upstream/bin`), then at `fallback`. Missing everywhere is not
+/// an error — the export just ships the un-optimized wasm.
 fn optimizeWasm(
     allocator: std.mem.Allocator,
     io: std.Io,
     output_dir: []const u8,
     files: *std.ArrayList(FileReport),
+    fallback: ?[]const u8,
 ) !bool {
+    const tools = [_]?[]const u8{ "wasm-opt", fallback };
+    var tool: usize = 0;
     const cwd = std.Io.Dir.cwd();
     const scratch = try optimizerScratch(allocator, io, output_dir);
     defer allocator.free(scratch);
@@ -399,13 +406,14 @@ fn optimizeWasm(
         const out_path = try std.fs.path.join(allocator, &.{ scratch, "optimized.wasm" });
         defer allocator.free(out_path);
 
-        const result = std.process.run(allocator, io, .{
-            .argv = &.{ "wasm-opt", "-O3", "--strip-debug", in_path, "-o", out_path },
-        }) catch {
-            // Spawn failure (wasm-opt absent) or IO error — leave the
-            // wasm as-is and stop trying.
-            return any;
-        };
+        // Spawn failure (wasm-opt absent) or IO error: try the next tool;
+        // with none left, leave the wasm as-is and stop trying.
+        const result = while (tool < tools.len) : (tool += 1) {
+            const exe = tools[tool] orelse continue;
+            break std.process.run(allocator, io, .{
+                .argv = &.{ exe, "-O3", "--strip-debug", in_path, "-o", out_path },
+            }) catch continue;
+        } else return any;
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
