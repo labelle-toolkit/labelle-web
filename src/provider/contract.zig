@@ -1,4 +1,4 @@
-//! Vendored verbatim from labelle-cli main (cli#473) src/cli/provider_contract.zig:
+//! Vendored verbatim from labelle-cli main 7892c59 (cli#473, #493) src/cli/provider_contract.zig:
 //! the provider wire 1.0.0-1.5.0 decoder. Re-vendor on a contract bump; the local
 //! edits are the test import paths and 1.3.x-1.5.x patch acceptance in `supported`.
 //! Provider contract v1. Pure validation; does not resolve or execute packages.
