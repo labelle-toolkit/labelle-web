@@ -185,7 +185,9 @@ Which emsdk, by settings `emsdk.source`:
    (`.labelle-web-activated`); a tree activated for another `emsdk.version`,
    or by someone else (CLI 2.x activates one copy itself), is re-activated for
    the requested version (`emsdk install` adds it, `emsdk activate` switches
-   to it). Offline, that re-activation is refused.
+   to it). Offline, that re-activation is refused. `labelle web doctor` reports package mode
+   under `LABELLE_OFFLINE` as unavailable unless every fetched tree is already
+   activated for the requested version.
 
 The managed install lives in the provider's cache (the CLI's `cache_dir`,
 `<LABELLE_HOME>/providers/<provider id>/`), shared by every project that pins
@@ -247,7 +249,8 @@ The `serve` hook reads `--port=N` and `--no-open` from the arguments after
 `labelle run` options (`--scene`, `--profile`, `--screenshot`, `--after`)
 reach the `serve` hook as `run.env` (`LABELLE_SCENE`, ...). A browser game
 has no process environment, so every served HTML page gets them in a script
-placed first in `<head>`: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
+placed right after the first real `<head>` tag (comments are skipped; without
+one, after `<body>`, else at the start), with every `<` in the values escaped: `window.LABELLE_RUN_ENV = {"LABELLE_SCENE": "intro"}`,
 plus a `Module.preRun` step that copies them into Emscripten's `ENV` before
 `main`. The game's `getenv` then sees them as on desktop; the engine's
 `requestedScene()` reads `LABELLE_SCENE` through `getenv`. The script extends

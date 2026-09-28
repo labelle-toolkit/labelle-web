@@ -71,7 +71,16 @@ pub fn checkEmsdk(a: std.mem.Allocator, io: std.Io, in: emsdk.Inputs) Item {
             item.detail = std.fmt.allocPrint(a, "managed emsdk {s} not installed yet; the next wasm build installs it into {s}", .{ i.version, i.dir }) catch i.dir;
             if (in.offline) item.hint = std.fmt.allocPrint(a, "LABELLE_OFFLINE is set: run `labelle web toolchain install {s}` with network access", .{i.version}) catch null;
         },
-        .package => item.detail = "package: the build activates the zig-pkg emsdk in place after generation",
+        .package => {
+            item.detail = "package: the build activates the zig-pkg emsdk in place after generation";
+            // Activation downloads the SDK; offline it only works when every
+            // fetched tree is already activated for this version.
+            if (in.offline and !(emsdk.packagesReady(a, io, in.project_dir, in.version()) catch false)) {
+                item.ok = false;
+                item.detail = std.fmt.allocPrint(a, "package: emsdk {s} is not activated in every fetched zig-pkg tree (or none was fetched yet), and activating it needs the network", .{in.version()}) catch "package: activation needs the network";
+                item.hint = "LABELLE_OFFLINE is set: build once with network access (or unset LABELLE_OFFLINE) so the fetched emsdk can be activated";
+            }
+        },
     }
     return item;
 }
@@ -90,6 +99,37 @@ pub fn run(a: std.mem.Allocator, io: std.Io, runner: emsdk.Runner, in: emsdk.Inp
         }
     }
     return cap.ok;
+}
+
+test "package mode offline: unavailable until every fetched emsdk is activated for the version" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var in: emsdk.Inputs = .{ .emsdk = .{ .source = .package }, .project_dir = project, .cache_dir = project, .inherited = null, .offline = false };
+    // Online: the build can activate; fine.
+    try testing.expect(checkEmsdk(a, io, in).ok);
+    // Offline with nothing fetched: unavailable, with the reason.
+    in.offline = true;
+    var item = checkEmsdk(a, io, in);
+    try testing.expect(!item.ok);
+    try testing.expect(std.mem.indexOf(u8, item.hint.?, "LABELLE_OFFLINE") != null);
+    // Fetched but not activated for 4.0.9: still unavailable.
+    const pkg = ".labelle/bgfx_wasm/zig-pkg/h";
+    try tmp.dir.createDirPath(io, pkg ++ "/upstream/emscripten");
+    for ([_][]const u8{ emsdk.launcher_name, "emsdk.py", emsdk.em_config_name, "upstream/emscripten/" ++ emsdk.emcc_name }) |f|
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ pkg, f }), .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = pkg ++ "/" ++ emsdk.package_marker_name, .data = "4.0.8" });
+    try testing.expect(!checkEmsdk(a, io, in).ok);
+    // Activated for the requested version: ok offline.
+    try tmp.dir.writeFile(io, .{ .sub_path = pkg ++ "/" ++ emsdk.package_marker_name, .data = emsdk.default_version });
+    item = checkEmsdk(a, io, in);
+    try testing.expect(item.ok);
+    try testing.expectEqual(@as(?[]const u8, null), item.hint);
 }
 
 test "the capability object keeps the studio item shape" {

@@ -611,8 +611,10 @@ pub fn runEnvScript(allocator: std.mem.Allocator, env: []const RunEnv) !?[]u8 {
     }
     try jws.endObject();
     const json = out.written();
-    // `</` would end the script element early; `<\/` is the same JSON string.
-    const safe = try std.mem.replaceOwned(u8, allocator, json, "</", "<\\/");
+    // No `<` may reach the script element: `</script` (any case) would end
+    // it and `<!--` changes how it is parsed. The JSON payload has `<` only
+    // inside strings, where `\u003c` is the same character.
+    const safe = try std.mem.replaceOwned(u8, allocator, json, "<", "\\u003c");
     defer allocator.free(safe);
     return try std.fmt.allocPrint(allocator,
         \\<script>
@@ -643,23 +645,44 @@ fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: [
 }
 
 /// Splice `script` right after the opening `<head ...>` tag, ahead of every
-/// page script; else after `<body ...>`; else at the start.
+/// page script; else after `<body ...>`; else at the start. The tags are
+/// found by `tagEnd`, which skips comments.
 fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
-    const at = tagEnd(html, "<head") orelse tagEnd(html, "<body") orelse 0;
+    const at = tagEnd(html, "head") orelse tagEnd(html, "body") orelse 0;
     return std.mem.concat(allocator, u8, &.{ html[0..at], script, html[at..] });
 }
 
-/// The index just past the `>` of the first `<name` tag (case-insensitive,
-/// not a longer tag name such as `<header>`).
-fn tagEnd(html: []const u8, open: []const u8) ?usize {
-    var from: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(html, from, open)) |at| {
-        const next = at + open.len;
-        if (next < html.len and (html[next] == '>' or std.ascii.isWhitespace(html[next]))) {
-            const close = std.mem.indexOfScalarPos(u8, html, next, '>') orelse return null;
-            return close + 1;
+/// The index just past the `>` of the first real `<name ...>` start tag:
+/// a small scan over the markup that skips `<!-- ... -->` comments (an
+/// unterminated one hides the rest of the page), matches the name
+/// case-insensitively and whole (`<header>` is not `<head>`), and allows
+/// attributes. Quoted attribute values may contain `>`.
+fn tagEnd(html: []const u8, name: []const u8) ?usize {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return null;
+            i = close + 3;
+            continue;
         }
-        from = next;
+        const start = lt + 1;
+        const end = start + name.len;
+        if (end <= html.len and std.ascii.eqlIgnoreCase(html[start..end], name) and
+            (end == html.len or html[end] == '>' or html[end] == '/' or std.ascii.isWhitespace(html[end])))
+        {
+            var quote: ?u8 = null;
+            var j = end;
+            while (j < html.len) : (j += 1) {
+                const c = html[j];
+                if (quote) |q| {
+                    if (c == q) quote = null;
+                } else if (c == '"' or c == '\'') {
+                    quote = c;
+                } else if (c == '>') return j + 1;
+            }
+            return null;
+        }
+        i = start;
     }
     return null;
 }
@@ -1049,13 +1072,43 @@ test "handleConnection: run options reach the page first in <head>; the endpoint
 
     const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
     defer alloc.free(page);
-    const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro<\\/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
+    const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro\\u003c/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
     try std.testing.expect(env_at > std.mem.indexOf(u8, page, "<HEAD lang=en>").?);
     try std.testing.expect(env_at < std.mem.indexOf(u8, page, "var Module={}").?);
     try std.testing.expect(std.mem.indexOf(u8, page, "location.reload") == null);
     const asset = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
     defer alloc.free(asset);
     try std.testing.expectEqualStrings("asset", testBody(asset));
+}
+
+test "runEnvScript: no `<` reaches the script element, whatever its case" {
+    const alloc = std.testing.allocator;
+    const script = (try runEnvScript(alloc, &.{.{ .name = "LABELLE_SCENE", .value = "a</ScRiPt><!--b" }})).?;
+    defer alloc.free(script);
+    const body = script["<script>".len..std.mem.lastIndexOf(u8, script, "</script>").?];
+    try std.testing.expect(std.mem.indexOfScalar(u8, body, '<') == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"a\\u003c/ScRiPt>\\u003c!--b\"") != null);
+    // And it is still the same string once parsed as JSON.
+    const start = std.mem.indexOf(u8, body, "{").?;
+    const json = body[start .. std.mem.indexOf(u8, body, "};").? + 1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a</ScRiPt><!--b", parsed.value.object.get("LABELLE_SCENE").?.string);
+}
+
+test "tagEnd skips comments, matches whole names in any case, allows attributes" {
+    const html = "<!doctype html><!-- <head> old --><HTML><header x=1></header><Head data-x=\"a>b\">T</head>";
+    const at = tagEnd(html, "head").?;
+    try std.testing.expectEqualStrings("T</head>", html[at..]);
+    try std.testing.expectEqual(@as(?usize, null), tagEnd("<!-- <head> -->", "head"));
+    try std.testing.expectEqual(@as(?usize, null), tagEnd("<p><!-- unterminated <head>", "head"));
+    const alloc = std.testing.allocator;
+    const got = try injectFirst(alloc, "<!-- <head> --><html><head><title>t</title></head></html>", "S");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("<!-- <head> --><html><head>S<title>t</title></head></html>", got);
+    const bare = try injectFirst(alloc, "<!-- <head> --><p>x</p>", "S");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("S<!-- <head> --><p>x</p>", bare);
 }
 
 test "injectFirst: after <head>, else <body>, else at the start; never inside <header>" {

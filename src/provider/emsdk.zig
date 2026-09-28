@@ -474,6 +474,25 @@ fn packageCurrent(a: std.mem.Allocator, io: std.Io, pkg: []const u8, version: []
     return std.mem.eql(u8, std.mem.trim(u8, recorded, " \r\n"), version);
 }
 
+/// Package mode without network: can every fetched emsdk under the
+/// project's `.labelle/*_wasm/zig-pkg/` already serve `version`? False when
+/// there is none (nothing fetched yet) or one still needs `emsdk install`.
+pub fn packagesReady(a: std.mem.Allocator, io: std.Io, project_dir: []const u8, version: []const u8) !bool {
+    const base = try std.fs.path.join(a, &.{ project_dir, ".labelle" });
+    var dir = std.Io.Dir.cwd().openDir(io, base, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var any = false;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory or !std.mem.endsWith(u8, entry.name, "_wasm")) continue;
+        for (try findPackages(a, io, try std.fs.path.join(a, &.{ base, entry.name }))) |pkg| {
+            if (!try packageCurrent(a, io, pkg, version)) return false;
+            any = true;
+        }
+    }
+    return any;
+}
+
 /// The `emsdk` dependency hash in the target's `build.zig.zon`, if any.
 fn zonEmsdkHash(a: std.mem.Allocator, io: std.Io, target_dir: []const u8) !?[]const u8 {
     const path = try std.fs.path.join(a, &.{ target_dir, "build.zig.zon" });
