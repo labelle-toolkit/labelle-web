@@ -1,4 +1,6 @@
-/// Static file server extracted from labelle-cli at 5eccdbc.
+/// Static file server extracted from labelle-cli at 5eccdbc. Rebuilds and
+/// file watching belong to the CLI (`labelle run --watch`); this server only
+/// serves the published output and reloads browsers (`watch.zig`).
 /// Minimal static file server for serving WASM builds locally.
 /// Serves files from `web_dir` on 127.0.0.1:`port`, opens the default
 /// browser, and runs until the process is interrupted (Ctrl+C).
@@ -10,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const watch = @import("watch.zig");
 
 /// Extension → Content-Type. WASM and JS are the load-bearing ones:
 /// browsers refuse to instantiate `application/wasm` served as
@@ -117,6 +120,23 @@ fn wakeLoop(io: std.Io, port: u16, cancel: *const std.atomic.Value(bool), stop: 
     }
 }
 
+/// Deadline thread body (`labelle run --timeout`, `run.timeout_ms`): once
+/// `ms` have passed, ask for the same clean stop Ctrl+C asks for, so the
+/// server returns and the provider exits 0. `stop` ends it early.
+fn deadlineLoop(io: std.Io, ms: u64, cancel: *std.atomic.Value(bool), stop: *const std.atomic.Value(bool)) void {
+    const tick: u64 = 20;
+    var waited: u64 = 0;
+    while (waited < ms) {
+        if (stop.load(.acquire) or cancel.load(.acquire)) return;
+        const step = @min(tick, ms - waited);
+        io.sleep(std.Io.Duration.fromMilliseconds(@intCast(step)), .awake) catch return;
+        waited += step;
+    }
+    if (stop.load(.acquire)) return;
+    std.debug.print("labelle-web: run timeout ({d} ms) reached; stopping the server\n", .{ms});
+    cancel.store(true, .release);
+}
+
 /// The accept loop. Returns once `cancel` is set — before handling any
 /// connection accepted after the request, so the wake-up poke (or a real
 /// request racing it) is closed unanswered. Per-connection errors never
@@ -134,7 +154,7 @@ fn serveLoop(
         const stream = server.accept(io) catch |err| {
             // Transient accept failures (e.g. the peer reset between
             // the SYN and our accept) shouldn't take the server down.
-            std.debug.print("labelle: accept failed ({s}), continuing\n", .{@errorName(err)});
+            std.debug.print("labelle-web: accept failed ({s}), continuing\n", .{@errorName(err)});
             continue;
         };
         if (cancel.load(.acquire)) {
@@ -142,7 +162,7 @@ fn serveLoop(
             return;
         }
         handleConnection(io, allocator, stream, web_dir, project_web_dir, watch_state, cancel) catch |err| {
-            std.debug.print("labelle: connection error ({s})\n", .{@errorName(err)});
+            std.debug.print("labelle-web: connection error ({s})\n", .{@errorName(err)});
         };
     }
 }
@@ -163,26 +183,39 @@ fn serveLoop(
 /// `open_browser` controls the auto-launch — `labelle wasm serve
 /// --no-open` passes `false` to suppress it.
 ///
-/// `watch` (cli#208) enables the rebuild-on-change live-reload loop: a
-/// background thread polls `watch.watch_dir`, runs `watch.rebuild_fn` on
-/// change, and bumps a shared build version that connected browsers poll
-/// via an injected client snippet (`/__labelle_livereload`). Pass `null`
-/// for a plain static serve.
+/// `session` is the `run.watch` object of a `labelle run --watch`
+/// replacement. With it every request is served from the published
+/// `session.output_dir` (`web_dir` is then only the banner's label), a
+/// poller thread follows `session.generation_file`, and connected browsers
+/// reload through an injected client polling `/__labelle_livereload`.
+/// Pass `null` for a plain static serve.
 pub fn serveAndOpen(
     allocator: std.mem.Allocator,
     web_dir: []const u8,
     project_web_dir: ?[]const u8,
     port: u16,
     open_browser_tab: bool,
-    watch: ?WatchConfig,
+    session: ?watch.Session,
+    run_env: []const RunEnv,
+    timeout_ms: ?u64,
 ) !void {
     const io = config.globalIo();
+
+    // The session starts at the generation the CLI published before it
+    // launched this replacement (0), read before the first request.
+    const env_script = try runEnvScript(allocator, run_env);
+    defer if (env_script) |e| allocator.free(e);
+    var wstate = WatchState{ .session = session, .run_env_script = env_script };
+    if (session) |s| {
+        const initial = (try watch.readGeneration(io, s.generation_file)) orelse return error.MissingWatchGeneration;
+        wstate.version.store(initial, .release);
+    }
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
         std.debug.print(
-            "labelle: could not bind 127.0.0.1:{d} ({s}).\n" ++
-                "  Another server may already be on that port — try a different --port.\n",
+            "labelle-web: could not bind 127.0.0.1:{d} ({s}).\n" ++
+                "  Another server may already be on that port; pass a different --port.\n",
             .{ port, @errorName(err) },
         );
         return err;
@@ -193,54 +226,45 @@ pub fn serveAndOpen(
     // after the bind ends the loop instead of the process. `wstate.stop`
     // also ends the waker if the loop is left some other way.
     installCancelHandler();
-    var wstate = WatchState{};
     const waker: ?std.Thread = std.Thread.spawn(.{}, wakeLoop, .{ io, port, &cancel_requested, &wstate.stop }) catch |err| blk: {
-        std.debug.print("labelle: could not start the stop watcher ({s}); Ctrl+C ends the process without after-run hooks\n", .{@errorName(err)});
+        std.debug.print("labelle-web: could not start the stop watcher ({s}); Ctrl+C ends the process without after-run hooks\n", .{@errorName(err)});
         break :blk null;
     };
     defer if (waker) |t| {
         wstate.stop.store(true, .release);
         t.join();
     };
-
-    // Start the file watcher before printing the banner so its status is
-    // reflected. `wstate` lives on this frame — `serveAndOpen` blocks until
-    // the stop is asked for, so it outlives the watcher thread and every
-    // connection.
-    var watch_thread: ?std.Thread = null;
-    if (watch) |cfg| {
-        watch_thread = std.Thread.spawn(.{}, watchLoop, .{ io, cfg, &wstate }) catch |err| blk: {
-            std.debug.print(
-                "labelle: could not start file watcher ({s}); serving without --watch\n",
-                .{@errorName(err)},
-            );
-            break :blk null;
-        };
-    }
-    defer if (watch_thread) |t| {
+    // A deadline without its thread would serve forever: fail instead.
+    const deadline: ?std.Thread = if (timeout_ms) |ms| try std.Thread.spawn(.{}, deadlineLoop, .{ io, ms, &cancel_requested, &wstate.stop }) else null;
+    defer if (deadline) |t| {
         wstate.stop.store(true, .release);
         t.join();
     };
-    // Only inject the reload client + answer the version endpoint when a
-    // watcher is actually running.
-    const watch_state: ?*WatchState = if (watch_thread != null) &wstate else null;
+
+    // A watch session without its poller would never reload: fail instead.
+    const poller: ?std.Thread = if (session) |s| try std.Thread.spawn(.{}, watch.pollLoop, .{ io, s, &wstate, @as(u32, 200) }) else null;
+    defer if (poller) |t| {
+        wstate.stop.store(true, .release);
+        t.join();
+    };
+    const watch_state: ?*WatchState = if (session != null or env_script != null) &wstate else null;
 
     std.debug.print(
-        "labelle: serving {s}\n" ++
+        "labelle-web: serving {s}\n" ++
             "  Local:   http://127.0.0.1:{d}\n" ++
             "{s}" ++
             "  Press Ctrl+C to stop\n",
         .{
-            web_dir,
+            if (session) |s| s.output_dir else web_dir,
             port,
-            if (watch_state != null) "  Watching for changes — edits rebuild + live-reload\n" else "",
+            if (session != null) "  Watch session: labelle rebuilds on change; this page reloads after each successful build\n" else "",
         },
     );
 
     if (open_browser_tab) openBrowser(allocator, port);
 
     serveLoop(io, allocator, &server, web_dir, project_web_dir, watch_state, &cancel_requested);
-    std.debug.print("\nlabelle: stopping server\n", .{});
+    std.debug.print("\nlabelle-web: stopping server\n", .{});
 }
 
 /// True if `path` names a regular file that can be opened for reading.
@@ -353,7 +377,7 @@ fn handleConnection(
     // the page to reload. Answered before static routing so the reserved
     // path never hits the filesystem while watching. Without a watcher,
     // the route remains available to ordinary project assets.
-    if (watch_state != null and std.mem.eql(u8, rel.?, livereload_rel)) {
+    if (watch_state != null and watch_state.?.session != null and std.mem.eql(u8, rel.?, livereload_rel)) {
         const version = if (watch_state) |ws| ws.version.load(.acquire) else 0;
         var buf: [24]u8 = undefined;
         const vbody = std.fmt.bufPrint(&buf, "{d}", .{version}) catch "0";
@@ -367,19 +391,35 @@ fn handleConnection(
         return;
     }
 
+    // A watch session serves the publication `output_dir` names right now,
+    // resolved once for this request so its path checks and its read agree
+    // on one generation. The previous publication is kept while a newer one
+    // is switched in, so a request never sees a partial tree.
+    // The generation this page is served from: read BEFORE resolving the
+    // publication. The CLI switches `output_dir` first and advances the
+    // generation after, so the embedded value is never newer than the files
+    // served; at worst it is older, which costs one extra reload.
+    const served_generation: u64 = if (watch_state) |ws| ws.version.load(.acquire) else 0;
+    const published: ?[:0]u8 = if (watch_state) |ws| if (ws.session) |session| (watch.servedRoot(allocator, io, session) catch {
+        try request.respond("503 Service Unavailable\n", .{ .status = .service_unavailable });
+        return;
+    }) else null else null;
+    defer if (published) |dir| allocator.free(dir);
+    const root_dir: []const u8 = published orelse web_dir;
+
     // The root request (`/` or a bare `/index.html`) is resolved
     // specially: prefer the project's clean shell, then a build-emitted
     // `index.html`, then emcc's `game.html`. Everything else is a plain
-    // `web_dir`-relative asset. The root candidates are fixed filenames
+    // `root_dir`-relative asset. The root candidates are fixed filenames
     // — not user-controlled — so they don't need `resolveTarget`'s
     // traversal hardening.
     const file_path = if (isRootRequest(rel.?))
-        (try resolveRoot(io, allocator, web_dir, project_web_dir)) orelse {
+        (try resolveRoot(io, allocator, root_dir, project_web_dir)) orelse {
             try request.respond("404 Not Found\n", .{ .status = .not_found });
             return;
         }
     else
-        try std.fs.path.join(allocator, &.{ web_dir, rel.? });
+        try std.fs.path.join(allocator, &.{ root_dir, rel.? });
     defer allocator.free(file_path);
 
     // Recheck containment on every request: files may change after startup.
@@ -393,7 +433,7 @@ fn handleConnection(
     };
     defer allocator.free(actual);
     var contained = false;
-    for ([_]?[]const u8{ web_dir, project_web_dir }) |candidate| {
+    for ([_]?[]const u8{ root_dir, project_web_dir }) |candidate| {
         const source = candidate orelse continue;
         const root = std.Io.Dir.cwd().realPathFileAlloc(io, source, allocator) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -424,7 +464,7 @@ fn handleConnection(
     // an HTML content-type regardless of the candidate that matched.
     const content_type = if (isRootRequest(rel.?)) "text/html; charset=utf-8" else mimeFor(rel.?);
 
-    // Cap the read so a stray huge file in `web_dir` can't OOM the
+    // Cap the read so a stray huge file in `root_dir` can't OOM the
     // server. 1 GiB is generous for a WASM bundle + assets.
     const max_file_bytes = 1024 * 1024 * 1024;
     const body = std.Io.Dir.cwd().readFileAlloc(io, actual, allocator, .limited(max_file_bytes)) catch |err| switch (err) {
@@ -442,15 +482,16 @@ fn handleConnection(
     };
     defer allocator.free(body);
 
-    // Under `--watch`, splice the live-reload client into served HTML so
-    // the open tab starts polling the version endpoint. Non-HTML assets
-    // (wasm/js/png/…) and non-watch serves pass through untouched.
+    // Served HTML gets the `labelle run` options first in <head> and, in a
+    // watch session, the reload client seeded with its generation. Other
+    // assets pass through untouched.
     const is_html = std.mem.startsWith(u8, content_type, "text/html");
-    const send_body: []const u8 = if (watch_state != null and is_html)
-        try injectReloadScript(allocator, body)
-    else
-        body;
-    defer if (send_body.ptr != body.ptr) allocator.free(send_body);
+    const env_script: ?[]const u8 = if (watch_state) |ws| ws.run_env_script else null;
+    const with_env: []const u8 = if (is_html and env_script != null) try injectFirst(allocator, body, env_script.?) else body;
+    defer if (with_env.ptr != body.ptr) allocator.free(with_env);
+    const reload = is_html and watch_state != null and watch_state.?.session != null;
+    const send_body: []const u8 = if (reload) try injectReloadScript(allocator, with_env, served_generation) else with_env;
+    defer if (send_body.ptr != with_env.ptr) allocator.free(send_body);
 
     // `request.respond` omits the body for HEAD requests automatically
     // while still emitting a `content-length` reflecting the real file
@@ -547,964 +588,137 @@ const livereload_path = "/__labelle_livereload";
 /// The `web_dir`-relative form `resolveTarget` yields for that path.
 const livereload_rel = "__labelle_livereload";
 
-/// Client snippet spliced into served HTML under `--watch`. Polls the
-/// version endpoint once a second; when the value changes (the watcher
-/// bumped it after a rebuild) it reloads the page. Plain ES5 + `fetch`,
-/// no dependencies — works in every browser that can run a WASM game.
-const reload_client_js =
-    \\<script>
-    \\(function () {
-    \\  var current = null;
-    \\  function poll() {
-    \\    fetch("/__labelle_livereload", { cache: "no-store" })
-    \\      .then(function (r) { return r.text(); })
-    \\      .then(function (v) {
-    \\        if (current === null) { current = v; }
-    \\        else if (v !== current) { location.reload(); return; }
-    \\        setTimeout(poll, 1000);
-    \\      })
-    \\      .catch(function () { setTimeout(poll, 2000); });
-    \\  }
-    \\  poll();
-    \\})();
-    \\</script>
-    \\
-;
-
-/// The rebuild callback signature. Returns true on a clean rebuild, false
-/// on any failure (the server stays up; the browser is NOT reloaded onto a
-/// broken build).
-pub const RebuildFn = *const fn (ctx: *anyopaque) bool;
-
-/// Watch configuration passed to `serveAndOpen`.
-pub const WatchConfig = struct {
-    /// Project source tree to poll for changes. Build-output and VCS dirs
-    /// (`.labelle`, `.git`, `zig-out`, …) are skipped so a rebuild — which
-    /// writes into `.labelle/` — can't trigger itself.
-    watch_dir: []const u8,
-    /// Invoked (on the watcher thread) after a debounced change.
-    rebuild_fn: RebuildFn,
-    /// Opaque payload handed back to `rebuild_fn`.
-    rebuild_ctx: *anyopaque,
-    /// Poll cadence.
-    poll_interval_ms: u32 = 400,
-    /// Consecutive stable polls required before firing a rebuild — debounces
-    /// a burst of saves into a single build. Minimum 1.
-    quiet_polls: u32 = 2,
-    /// Files the rebuild itself WRITES into the watched tree: the declared
-    /// `.outputs` of the project's `.prebuild` steps (cli#355), as paths
-    /// rooted the same way the walk builds them — see `watchIgnorePath`.
-    ///
-    /// They are excluded from the signature entirely, the same way
-    /// `.labelle/` already is. Folding them in made a hook's own
-    /// regeneration look like a fresh edit: `applied` is the signature
-    /// captured BEFORE the rebuild callback, so the next poll saw the
-    /// hook's write as a new change and ran a SECOND full
-    /// generate/compile/browser-reload for it.
-    ///
-    /// Excluding rather than re-snapshotting after every callback is
-    /// deliberate: a re-snapshot would also swallow a source file the
-    /// user saved DURING the rebuild, which is a silently dropped edit —
-    /// strictly worse than a redundant one. A declared output is a
-    /// generated target, not a source; the input that produces it is
-    /// still watched, so a real change still fires exactly one rebuild.
-    ///
-    /// Writers with no such declaration — provider lifecycle hooks, a
-    /// prebuild step without `.outputs` — are bounded by `WatchBaseline`
-    /// instead: their write costs a bounded number of follow-up rebuilds
-    /// (one when it rewrites the same paths), never a loop.
-    ignore_files: []const []const u8 = &.{},
-};
-
-/// Shared state between the watcher thread and the serve loop. `version`
-/// is what the browser polls; `stop` lets `serveAndOpen`'s defer join the
-/// thread cleanly (only exercised if the accept loop ever returns).
-const WatchState = struct {
-    version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-/// Directory names skipped while walking the watch tree. `.labelle` is the
-/// load-bearing one — the rebuild writes there, so watching it would loop.
-const watch_skip_dirs = [_][]const u8{ "zig-out", "zig-cache", "zig-pkg" };
-
-/// A cheap fingerprint of a source tree: a file count plus a `digest`
-/// that folds in every file's `(path, size, mtime)`. Folding per file
-/// (rather than only summing sizes + tracking the single newest mtime)
-/// makes the signature sensitive to *any* single-file change — including a
-/// same-size edit to a non-newest file, or swapping content between two
-/// files — so any add / edit / remove / mtime-change flips it.
-const TreeSignature = struct {
-    file_count: u64 = 0,
-    /// Order-independent digest: each file contributes an independent
-    /// 64-bit hash of its path+size+mtime, XOR-folded in. XOR is
-    /// commutative, so directory iteration order doesn't matter, and a
-    /// change to any single file toggles the bits its hash owns.
-    digest: u64 = 0,
-
-    /// Fold one file's identity into the signature.
-    fn mix(self: *TreeSignature, path: []const u8, size: u64, mtime_ns: i128) void {
-        var h = std.hash.Wyhash.init(0);
-        h.update(path);
-        h.update(std.mem.asBytes(&size));
-        const m: i128 = mtime_ns;
-        h.update(std.mem.asBytes(&m));
-        self.file_count += 1;
-        self.digest ^= h.final();
-    }
-
-    fn eql(a: TreeSignature, b: TreeSignature) bool {
-        return a.file_count == b.file_count and a.digest == b.digest;
-    }
-};
-
-/// One file's entry in a `TreeSnapshot`: a hash of its path (`key`) and of
-/// its `(size, mtime)` (`state`).
-const PathState = struct {
-    key: u64,
-    state: u64,
-
-    fn lessThan(_: void, a: PathState, b: PathState) bool {
-        return a.key < b.key;
-    }
-};
-
-/// The key a path gets in a `TreeSnapshot`.
-fn pathKey(path: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, path);
+/// The reload client spliced into served HTML in a watch session. It starts
+/// from `generation`, the publication the page was served from, and polls
+/// the version endpoint once a second; any other value reloads the page. A
+/// generation published between serving the page and its first poll is
+/// therefore a reload, not a new baseline. Plain ES5 + `fetch`.
+fn reloadClient(allocator: std.mem.Allocator, generation: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\<script>
+        \\(function () {{
+        \\  var current = "{d}";
+        \\  function poll() {{
+        \\    fetch("/__labelle_livereload", {{ cache: "no-store" }})
+        \\      .then(function (r) {{ return r.text(); }})
+        \\      .then(function (v) {{
+        \\        if (v !== current) {{ location.reload(); return; }}
+        \\        setTimeout(poll, 1000);
+        \\      }})
+        \\      .catch(function () {{ setTimeout(poll, 2000); }});
+        \\  }}
+        \\  poll();
+        \\}})();
+        \\</script>
+        \\
+    , .{generation});
 }
 
-/// The watched tree at one instant: its `TreeSignature` plus every file's
-/// `PathState`, sorted by key, so two snapshots can be diffed per path
-/// (`changedPaths`). Taken only around a rebuild — the cheap signature
-/// alone still drives the polls.
-const TreeSnapshot = struct {
-    sig: TreeSignature = .{},
-    paths: std.ArrayList(PathState) = .empty,
-    /// False when recording a path failed (out of memory): the per-path
-    /// view is partial, so no delta can be drawn from it.
-    complete: bool = true,
-
-    fn record(self: *TreeSnapshot, a: std.mem.Allocator, path: []const u8, size: u64, mtime_ns: i128) void {
-        self.sig.mix(path, size, mtime_ns);
-        var h = std.hash.Wyhash.init(0);
-        h.update(std.mem.asBytes(&size));
-        const m: i128 = mtime_ns;
-        h.update(std.mem.asBytes(&m));
-        self.paths.append(a, .{ .key = pathKey(path), .state = h.final() }) catch {
-            self.complete = false;
-        };
+/// The `labelle run` options (`run.env`: `LABELLE_SCENE`, `LABELLE_PROFILE`,
+/// ...) for a page, as a script placed first in `<head>`: it publishes them
+/// as `window.LABELLE_RUN_ENV` and adds a `Module.preRun` step copying them
+/// into Emscripten's `ENV`, so the game's `getenv` (the engine's
+/// `requestedScene()` reads `LABELLE_SCENE`) sees them as on desktop. The
+/// Module object is created if absent and otherwise extended, which classic
+/// glue (`var Module = typeof Module != "undefined" ? Module : {}`) and
+/// `LabelleLoader.install(window.Module || {})` both keep. Null when there
+/// are no options. Caller owns the result.
+pub fn runEnvScript(allocator: std.mem.Allocator, env: []const RunEnv) !?[]u8 {
+    if (env.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer };
+    try jws.beginObject();
+    for (env) |pair| {
+        try jws.objectField(pair.name);
+        try jws.write(pair.value);
     }
+    try jws.endObject();
+    const json = out.written();
+    // No `<` may reach the script element: `</script` (any case) would end
+    // it and `<!--` changes how it is parsed. The JSON payload has `<` only
+    // inside strings, where `\u003c` is the same character.
+    const safe = try std.mem.replaceOwned(u8, allocator, json, "<", "\\u003c");
+    defer allocator.free(safe);
+    return try std.fmt.allocPrint(allocator,
+        \\<script>
+        \\window.LABELLE_RUN_ENV = {s};
+        \\(function (m) {{
+        \\  m.preRun = [].concat(m.preRun || []);
+        \\  m.preRun.push(function () {{
+        \\    var env = typeof ENV !== "undefined" ? ENV : m.ENV;
+        \\    if (!env) return;
+        \\    for (var k in window.LABELLE_RUN_ENV) env[k] = window.LABELLE_RUN_ENV[k];
+        \\  }});
+        \\}})(window.Module = window.Module || {{}});
+        \\</script>
+        \\
+    , .{safe});
+}
 
-    fn sort(self: *TreeSnapshot) void {
-        std.mem.sort(PathState, self.paths.items, {}, PathState.lessThan);
-    }
-};
+pub const RunEnv = struct { name: []const u8, value: []const u8 };
 
-/// The keys of the paths added, removed or changed between two sorted
-/// snapshots, ascending. Caller owns the result.
-fn changedPaths(a: std.mem.Allocator, before: []const PathState, after: []const PathState) ![]u64 {
-    var out: std.ArrayList(u64) = .empty;
-    errdefer out.deinit(a);
+/// Shared between the generation poller and the serve loop (`watch.zig`).
+const WatchState = watch.State;
+
+/// Splice `script` into `html` just before `</body>` (or append it when
+/// there's no body tag). Caller owns the returned buffer.
+fn injectBeforeBodyEnd(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
+    if (std.mem.lastIndexOf(u8, html, "</body>")) |idx| return std.mem.concat(allocator, u8, &.{ html[0..idx], script, html[idx..] });
+    return std.mem.concat(allocator, u8, &.{ html, script });
+}
+
+/// Splice `script` right after the opening `<head ...>` tag, ahead of every
+/// page script; else after `<body ...>`; else at the start. The tags are
+/// found by `tagEnd`, which skips comments.
+fn injectFirst(allocator: std.mem.Allocator, html: []const u8, script: []const u8) ![]u8 {
+    const at = tagEnd(html, "head") orelse tagEnd(html, "body") orelse 0;
+    return std.mem.concat(allocator, u8, &.{ html[0..at], script, html[at..] });
+}
+
+/// The index just past the `>` of the first real `<name ...>` start tag:
+/// a small scan over the markup that skips `<!-- ... -->` comments (an
+/// unterminated one hides the rest of the page), matches the name
+/// case-insensitively and whole (`<header>` is not `<head>`), and allows
+/// attributes. Quoted attribute values may contain `>`.
+fn tagEnd(html: []const u8, name: []const u8) ?usize {
     var i: usize = 0;
-    var j: usize = 0;
-    while (i < before.len or j < after.len) {
-        if (j == after.len or (i < before.len and before[i].key < after[j].key)) {
-            try out.append(a, before[i].key);
-            i += 1;
-        } else if (i == before.len or after[j].key < before[i].key) {
-            try out.append(a, after[j].key);
-            j += 1;
-        } else {
-            if (before[i].state != after[j].state) try out.append(a, before[i].key);
-            i += 1;
-            j += 1;
-        }
-    }
-    return out.toOwnedSlice(a);
-}
-
-/// How many keys of sorted `keys` are not in sorted `seen`.
-fn countNovel(keys: []const u64, seen: []const u64) usize {
-    var n: usize = 0;
-    var j: usize = 0;
-    for (keys) |key| {
-        while (j < seen.len and seen[j] < key) j += 1;
-        if (j == seen.len or seen[j] != key) n += 1;
-    }
-    return n;
-}
-
-/// The sorted, deduplicated union of sorted `x` and `y`. Caller owns it.
-fn unionKeys(a: std.mem.Allocator, x: []const u64, y: []const u64) ![]u64 {
-    var out: std.ArrayList(u64) = .empty;
-    errdefer out.deinit(a);
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < x.len or j < y.len) {
-        if (j == y.len or (i < x.len and x[i] < y[j])) {
-            try out.append(a, x[i]);
-            i += 1;
-        } else if (i == x.len or y[j] < x[i]) {
-            try out.append(a, y[j]);
-            j += 1;
-        } else {
-            try out.append(a, x[i]);
-            i += 1;
-            j += 1;
-        }
-    }
-    return out.toOwnedSlice(a);
-}
-
-/// True when every key of sorted `sub` is in sorted `super`.
-fn isSubset(sub: []const u64, super: []const u64) bool {
-    var j: usize = 0;
-    for (sub) |key| {
-        while (j < super.len and super[j] < key) j += 1;
-        if (j == super.len or super[j] != key) return false;
-        j += 1;
-    }
-    return true;
-}
-
-/// Which tree signature counts as built once a rebuild callback returns.
-///
-/// Each rebuild is bracketed by two snapshots of the watched tree: `start`,
-/// taken right before the callback (the rebuild's trigger), and `post`,
-/// right after it. Their per-path diff is the rebuild's `delta`: every path
-/// that changed WHILE it ran — its own writes (a provider lifecycle hook
-/// declares no outputs; a prebuild step may omit `.outputs`) and any edit
-/// the user saved meanwhile, which the rebuild may or may not have read.
-///
-/// The rule:
-///
-/// - A rebuild whose `delta` is empty is built at its trigger (= `post`).
-/// - A rebuild is SETTLED — `post` counts as built — only when it is a
-///   follow-up (fired for exactly the previous rebuild's `post`: nothing
-///   changed between the two) AND its `delta` is a subset of the previous
-///   rebuild's `delta`. A self-writing hook rewrites the same paths on
-///   every run, so its follow-up changes nothing new and settles: one extra
-///   rebuild per edit, never a loop (Codex P2 on #420).
-/// - Otherwise the rebuild is built at its trigger only, so `post` stays
-///   unbuilt and fires one more rebuild. A path the user saves during a
-///   rebuild — the first one or a follow-up — is a path that rebuild's
-///   predecessor did not change, so the next rebuild is scheduled and
-///   reads it (Codex P2 on #427: the follow-up used to accept its whole
-///   `post`, an edit it had already compiled past included). That next
-///   rebuild is itself a follow-up whose `delta` is the hook's writes
-///   again, so the chain still ends.
-///
-/// Snapshots are `(size, mtime)` per path, so one case stays ambiguous: a
-/// path changed during two CONSECUTIVE rebuilds (a user re-saving, during
-/// the follow-up, the same file they also saved during the rebuild before
-/// it) is indistinguishable from a hook rewriting its output, and is taken
-/// as the follow-up's own write. Settling there is what bounds the hook.
-///
-/// Follow-up cap. A writer that changes a DIFFERENT path on every run (a
-/// timestamp-named report: `{a}`, then `{b}`, then `{c}`) never satisfies
-/// the subset rule, and used to rebuild and reload forever (Codex P2 on
-/// #427). A chain — a rebuild plus the consecutive follow-ups fired for
-/// exactly their predecessor's `post` — therefore also tracks the union of
-/// every delta in it (`recent`) and the writers' `footprint`: the fewest
-/// paths outside `recent` that any rebuild of the chain changed (a varying
-/// writer's per-run count; an edit saved meanwhile only adds to it). From
-/// the `follow_up_cap`-th follow-up on, a follow-up that changed no more
-/// new-to-the-chain paths than that footprint is taken as the writers'
-/// own and SETTLES on its `post`, logged once as `labelle: watch: settled
-/// after N follow-up rebuilds triggered by build outputs`. One that changed
-/// more — the writers' new path plus a source the user saved during it —
-/// still fires one more rebuild, so the edit is read. A user edit saved
-/// between rebuilds never makes a follow-up at all (the trigger is not the
-/// previous `post`): it always rebuilds and starts a new chain. The count
-/// cannot tell apart an edit, saved during a capped follow-up, that adds
-/// no new-to-the-chain path beyond the footprint — a re-save of a path
-/// already in `recent`, or one landing on a run where the writers changed
-/// fewer new paths than usual — and takes it as a build output: the
-/// ambiguity above, widened to the chain.
-///
-/// Ceiling. The `follow_up_ceiling`-th follow-up of a chain settles only
-/// the chain's own output paths — those an earlier rebuild of the chain
-/// changed (`recent`). A path outside that set (a source the user saved
-/// while that follow-up ran, or a writer's new output: the two cannot be
-/// told apart) stays pending: the tree it left is unbuilt, so one more
-/// rebuild reads it, and that rebuild starts a FRESH chain rather than
-/// counting as a ninth follow-up (Codex P2 on #427, cli#429: the ceiling
-/// used to mark every path the final callback saw as built). As the last
-/// bound, a chain started that way which reaches the ceiling again
-/// settles whatever it changed, so no writer (one whose output count keeps
-/// growing, say) can loop: it costs at most two chains.
-const WatchBaseline = struct {
-    /// Follow-ups after which a varying-path chain may settle (see above).
-    const follow_up_cap: u32 = 2;
-    /// Follow-ups after which a chain settles unconditionally.
-    const follow_up_ceiling: u32 = 8;
-
-    /// Signature of the last (attempted) build.
-    applied: TreeSignature,
-    /// Signature taken right after the last rebuild callback returned.
-    post: ?TreeSignature = null,
-    /// Sorted keys of the paths the last rebuild changed while it ran;
-    /// `null` when unknown (none yet, or its snapshots were partial).
-    /// Owned by `allocator`.
-    delta: ?[]u64 = null,
-    /// Consecutive follow-ups in the current chain.
-    follow_ups: u32 = 0,
-    /// Sorted union of the current chain's deltas; `null` when no chain is
-    /// tracked (none yet, a delta was unknown, or it could not be stored).
-    /// Owned by `allocator`.
-    recent: ?[]u64 = null,
-    /// Fewest new-to-the-chain paths any rebuild of the chain changed.
-    footprint: usize = 0,
-    /// Set by the `settle` that ended a chain by the follow-up cap: how many
-    /// follow-ups it took (the watcher logs it); 0 otherwise.
-    capped: u32 = 0,
-    /// Set when a chain reached the ceiling with paths outside its own
-    /// outputs: the next rebuild (fired for that pending tree) starts a
-    /// fresh chain instead of counting as another follow-up.
-    restart_chain: bool = false,
-    /// The current chain was started by such a ceiling: reaching the
-    /// ceiling again settles unconditionally (the last bound).
-    after_ceiling: bool = false,
-    allocator: std.mem.Allocator,
-
-    fn deinit(self: *WatchBaseline) void {
-        if (self.delta) |d| self.allocator.free(d);
-        self.delta = null;
-        self.dropChain();
-    }
-
-    fn dropChain(self: *WatchBaseline) void {
-        self.forgetRecent();
-        self.follow_ups = 0;
-        self.footprint = 0;
-    }
-
-    /// Record a finished rebuild fired for `trigger` (its start-of-rebuild
-    /// signature), with the tree at `post` once the callback returned and
-    /// `delta` the sorted keys of the paths that changed in between
-    /// (`null`: unknown, which never settles on `post`). Borrows `delta`.
-    fn settle(self: *WatchBaseline, trigger: TreeSignature, post: TreeSignature, delta: ?[]const u64) void {
-        const restarted = self.restart_chain;
-        self.restart_chain = false;
-        const follow_up = !restarted and if (self.post) |previous| trigger.eql(previous) else false;
-        if (!follow_up) {
-            self.dropChain();
-            self.after_ceiling = restarted;
-        }
-        self.capped = 0;
-        const by_rule = if (delta) |d|
-            d.len == 0 or (follow_up and self.delta != null and isSubset(d, self.delta.?))
-        else
-            false;
-        const settled = by_rule or self.chain(follow_up, delta);
-        self.applied = if (settled) post else trigger;
-        self.post = post;
-        const kept: ?[]u64 = if (delta) |d| self.allocator.dupe(u64, d) catch null else null;
-        if (self.delta) |old| self.allocator.free(old);
-        self.delta = kept;
-    }
-
-    /// The follow-up cap (see the type's doc): count a follow-up, record
-    /// `delta` in the chain, and return true when this follow-up settles by
-    /// the cap or the ceiling. An unknown `delta` stops the chain's path
-    /// tracking (the cap cannot judge it) but still counts toward the
-    /// ceiling, where it is judged as changing paths outside the chain.
-    fn chain(self: *WatchBaseline, follow_up: bool, delta: ?[]const u64) bool {
-        if (follow_up) self.follow_ups +|= 1;
-        const d = delta orelse {
-            self.forgetRecent();
-            return self.atCeiling(follow_up, null) == .settled;
-        };
-        const novel = if (self.recent) |r| countNovel(d, r) else d.len;
-        if (follow_up and self.recent != null and self.follow_ups >= follow_up_cap and novel <= self.footprint) {
-            self.capped = self.follow_ups;
-            self.dropChain();
-            return true;
-        }
-        switch (self.atCeiling(follow_up, d)) {
-            .below => {},
-            .settled => return true,
-            .pending => return false,
-        }
-        const first = self.recent == null;
-        const merged = unionKeys(self.allocator, self.recent orelse &.{}, d) catch {
-            // Out of memory: stop tracking; only the ceiling still bounds it.
-            self.forgetRecent();
-            return false;
-        };
-        self.forgetRecent();
-        self.recent = merged;
-        self.footprint = if (first) novel else @min(self.footprint, novel);
-        return false;
-    }
-
-    fn forgetRecent(self: *WatchBaseline) void {
-        if (self.recent) |r| self.allocator.free(r);
-        self.recent = null;
-    }
-
-    const Ceiling = enum { below, settled, pending };
-
-    /// The ceiling (see the type's doc), judged BEFORE `delta` joins
-    /// `recent`: a follow-up at the ceiling settles when every path it
-    /// changed is one of the chain's own outputs, or when the chain was
-    /// itself started by a ceiling (the last bound). Otherwise the chain
-    /// ends with its `post` pending, and the rebuild that reads it starts a
-    /// fresh chain.
-    fn atCeiling(self: *WatchBaseline, follow_up: bool, delta: ?[]const u64) Ceiling {
-        if (!follow_up or self.follow_ups < follow_up_ceiling) return .below;
-        const own = if (delta) |d| if (self.recent) |r| isSubset(d, r) else false else false;
-        const settled = own or self.after_ceiling;
-        if (settled) self.capped = self.follow_ups;
-        self.dropChain();
-        self.after_ceiling = false;
-        self.restart_chain = !settled;
-        return if (settled) .settled else .pending;
-    }
-
-    /// True when `sig` differs from the last build (subject to debounce).
-    fn unbuilt(self: WatchBaseline, sig: TreeSignature) bool {
-        return !sig.eql(self.applied);
-    }
-};
-
-/// True when a directory name should be skipped during the walk: any
-/// dot-prefixed dir (`.labelle`, `.git`, `.zig-cache`, `.cache`) plus the
-/// non-hidden build dirs in `watch_skip_dirs`.
-fn skipWatchDir(name: []const u8) bool {
-    if (name.len > 0 and name[0] == '.') return true;
-    for (watch_skip_dirs) |d| {
-        if (std.mem.eql(u8, name, d)) return true;
-    }
-    return false;
-}
-
-/// Root a project-relative declared path (a `.prebuild` `.outputs` entry)
-/// the same way `computeSignature`'s walk builds its paths, so the two can
-/// be compared as plain strings. `resolve` collapses a leading `./` and
-/// any `..` first — pure path math, no filesystem access — so
-/// `"./assets/out.png"` and `"assets/out.png"` both match the walked
-/// `<watch_dir>/assets/out.png`. Caller owns the result.
-pub fn watchIgnorePath(
-    allocator: std.mem.Allocator,
-    watch_dir: []const u8,
-    rel: []const u8,
-) ![]const u8 {
-    const norm = try std.fs.path.resolve(allocator, &.{rel});
-    defer allocator.free(norm);
-    return std.fs.path.join(allocator, &.{ watch_dir, norm });
-}
-
-/// True when `dir_path` is the root of its own git checkout: a linked
-/// worktree, a submodule, or a nested clone.
-///
-/// Same marker probe as `labelle test`'s walker (#371): test for the
-/// *existence* of a `.git` entry, never its kind — `git worktree add`
-/// and submodules both write `.git` as a regular FILE holding a
-/// `gitdir:` pointer. `skipWatchDir`'s dot rule only catches a checkout
-/// whose own folder is dot-prefixed; a copy of the project parked under
-/// a plain name (`worktrees/`, `vendor/`, `branches/`) would otherwise
-/// fold thousands of unrelated files into the signature and make edits
-/// on another branch trigger rebuilds here.
-fn isNestedCheckout(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
-    const marker = std.fs.path.join(allocator, &.{ dir_path, ".git" }) catch return false;
-    defer allocator.free(marker);
-    std.Io.Dir.cwd().access(io, marker, .{}) catch return false;
-    return true;
-}
-
-/// True when a walked file path is one of the rebuild's own declared
-/// outputs and must not contribute to the signature.
-fn skipWatchFile(path: []const u8, ignore_files: []const []const u8) bool {
-    for (ignore_files) |ig| {
-        if (std.mem.eql(u8, path, ig)) return true;
-    }
-    return false;
-}
-
-/// Accumulate `dir_path`'s tree signature into `sig`. Best-effort: an
-/// unreadable dir/file is skipped rather than fatal (a transient rename
-/// mid-scan just shows up as a change on the next poll). Recurses into
-/// subdirectories except those `skipWatchDir` rejects and those that are
-/// nested git checkouts (#371).
-fn computeSignature(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    ignore_files: []const []const u8,
-    sig: *TreeSignature,
-) void {
-    var snap: TreeSnapshot = .{ .sig = sig.* };
-    walkTree(io, allocator, dir_path, ignore_files, &snap, false);
-    sig.* = snap.sig;
-}
-
-/// The watched tree's `TreeSnapshot`: `computeSignature`'s walk, also
-/// recording every file's `PathState` (sorted). `allocator` owns `paths`.
-fn snapshotTree(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    ignore_files: []const []const u8,
-) TreeSnapshot {
-    var snap: TreeSnapshot = .{};
-    walkTree(io, allocator, dir_path, ignore_files, &snap, true);
-    snap.sort();
-    return snap;
-}
-
-fn walkTree(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    ignore_files: []const []const u8,
-    snap: *TreeSnapshot,
-    per_path: bool,
-) void {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-
-    var it = dir.iterate();
-    while (it.next(io) catch return) |entry| {
-        if (entry.kind == .directory) {
-            if (skipWatchDir(entry.name)) continue;
-            const sub = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
-            defer allocator.free(sub);
-            if (isNestedCheckout(io, allocator, sub)) continue;
-            walkTree(io, allocator, sub, ignore_files, snap, per_path);
-        } else if (entry.kind == .file) {
-            const fpath = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
-            defer allocator.free(fpath);
-            if (skipWatchFile(fpath, ignore_files)) continue;
-            const st = std.Io.Dir.cwd().statFile(io, fpath, .{}) catch continue;
-            if (per_path) {
-                snap.record(allocator, fpath, st.size, st.mtime.nanoseconds);
-            } else {
-                snap.sig.mix(fpath, st.size, st.mtime.nanoseconds);
-            }
-        }
-    }
-}
-
-/// Pure debounce decision: fire a rebuild once the tree has held a new,
-/// unbuilt signature steady for at least `quiet_polls` consecutive polls.
-/// Extracted for unit testing the burst-coalescing logic without threads.
-fn shouldRebuild(unbuilt: bool, stable_polls: u32, quiet_polls: u32) bool {
-    const need = if (quiet_polls == 0) 1 else quiet_polls;
-    return unbuilt and stable_polls >= need;
-}
-
-/// Splice `reload_client_js` into `html` just before `</body>` (or append
-/// it when there's no body tag). Caller owns the returned buffer.
-fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
-    const marker = "</body>";
-    if (std.mem.lastIndexOf(u8, html, marker)) |idx| {
-        var out = try allocator.alloc(u8, html.len + reload_client_js.len);
-        @memcpy(out[0..idx], html[0..idx]);
-        @memcpy(out[idx..][0..reload_client_js.len], reload_client_js);
-        @memcpy(out[idx + reload_client_js.len ..], html[idx..]);
-        return out;
-    }
-    return std.mem.concat(allocator, u8, &.{ html, reload_client_js });
-}
-
-/// Watcher thread body: poll the tree, debounce, rebuild, bump version.
-/// Runs until `state.stop` is set. A rebuild failure is surfaced in the
-/// terminal but keeps the loop (and server) alive; `applied` still advances
-/// so we don't respin on the same broken tree — a later edit retriggers.
-fn watchLoop(io: std.Io, cfg: WatchConfig, state: *WatchState) void {
-    var scan_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scan_arena.deinit();
-
-    // `baseline.applied` = signature of the last (attempted) build (see
-    // `WatchBaseline` for how a self-writing rebuild settles it). `last` =
-    // signature seen on the previous poll — used to detect a burst still in
-    // flight.
-    var initial = TreeSignature{};
-    computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &initial);
-    _ = scan_arena.reset(.retain_capacity);
-    var baseline: WatchBaseline = .{ .applied = initial, .allocator = std.heap.page_allocator };
-    defer baseline.deinit();
-    // The two per-path snapshots bracketing each rebuild; reset after it.
-    var rebuild_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer rebuild_arena.deinit();
-    var last = initial;
-    var stable_polls: u32 = 0;
-
-    const interval = std.Io.Duration.fromMilliseconds(@intCast(cfg.poll_interval_ms));
-
-    while (!state.stop.load(.acquire)) {
-        io.sleep(interval, .awake) catch return;
-        if (state.stop.load(.acquire)) return;
-
-        var sig = TreeSignature{};
-        computeSignature(io, scan_arena.allocator(), cfg.watch_dir, cfg.ignore_files, &sig);
-        _ = scan_arena.reset(.retain_capacity);
-
-        if (!sig.eql(last)) {
-            // Tree still changing — reset the quiet counter (debounce).
-            last = sig;
-            stable_polls = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
+            const close = std.mem.indexOfPos(u8, html, lt + 4, "-->") orelse return null;
+            i = close + 3;
             continue;
         }
-        stable_polls +|= 1;
-        if (!shouldRebuild(baseline.unbuilt(sig), stable_polls, cfg.quiet_polls)) continue;
-
-        std.debug.print("labelle: change detected — rebuilding WASM...\n", .{});
-        // The tree as this rebuild starts on it, and as the callback leaves
-        // it: their per-path diff is what changed while it ran
-        // (`WatchBaseline`).
-        const ra = rebuild_arena.allocator();
-        const start = snapshotTree(io, ra, cfg.watch_dir, cfg.ignore_files);
-        const ok = cfg.rebuild_fn(cfg.rebuild_ctx);
-        const post = snapshotTree(io, ra, cfg.watch_dir, cfg.ignore_files);
-        const delta: ?[]const u64 = if (start.complete and post.complete)
-            changedPaths(ra, start.paths.items, post.paths.items) catch null
-        else
-            null;
-        baseline.settle(start.sig, post.sig, delta);
-        if (baseline.capped != 0) std.debug.print("labelle: watch: settled after {d} follow-up rebuilds triggered by build outputs\n", .{baseline.capped});
-        _ = rebuild_arena.reset(.retain_capacity);
-        stable_polls = 0;
-        if (ok) {
-            _ = state.version.fetchAdd(1, .release);
-            std.debug.print("labelle: rebuild ok — reloading connected browsers\n", .{});
-        } else {
-            std.debug.print("labelle: rebuild failed — see errors above; server still running\n", .{});
+        const start = lt + 1;
+        const end = start + name.len;
+        if (end <= html.len and std.ascii.eqlIgnoreCase(html[start..end], name) and
+            (end == html.len or html[end] == '>' or html[end] == '/' or std.ascii.isWhitespace(html[end])))
+        {
+            var quote: ?u8 = null;
+            var j = end;
+            while (j < html.len) : (j += 1) {
+                const c = html[j];
+                if (quote) |q| {
+                    if (c == q) quote = null;
+                } else if (c == '"' or c == '\'') {
+                    quote = c;
+                } else if (c == '>') return j + 1;
+            }
+            return null;
         }
+        i = start;
     }
+    return null;
+}
+
+/// The reload client for `generation`, before `</body>`.
+fn injectReloadScript(allocator: std.mem.Allocator, html: []const u8, generation: u64) ![]u8 {
+    const client = try reloadClient(allocator, generation);
+    defer allocator.free(client);
+    return injectBeforeBodyEnd(allocator, html, client);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
-
-/// A distinct synthetic tree signature per label, for the baseline tests.
-fn testSig(label: []const u8) TreeSignature {
-    var sig = TreeSignature{};
-    sig.mix(label, label.len, 0);
-    return sig;
-}
-
-/// A scripted rebuild for the baseline tests: the sorted path keys that
-/// changed while it ran.
-fn testDelta(comptime paths: []const []const u8) [paths.len]u64 {
-    var keys: [paths.len]u64 = undefined;
-    for (paths, 0..) |path, i| keys[i] = pathKey(path);
-    std.mem.sort(u64, &keys, {}, std.sort.asc(u64));
-    return keys;
-}
-
-test "watch baseline: a rebuild that rewrites its own output settles after one follow-up" {
-    // A hook that rewrites `assets/out.png` on every run: each callback
-    // leaves the tree at a fresh signature, with that one path changed.
-    const hook = testDelta(&.{"assets/out.png"});
-    const edited = testSig("user edit");
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    try std.testing.expect(b.unbuilt(edited));
-    // Rebuild 1, for the user's edit; its hook writes -> `write1`.
-    const write1 = testSig("hook write 1");
-    b.settle(edited, write1, &hook);
-    // The hook's write is unbuilt: one follow-up rebuild fires.
-    try std.testing.expect(b.unbuilt(write1));
-    // The follow-up's hook writes the same path again -> `write2`: nothing
-    // its predecessor did not change, so it settles on `write2`.
-    const write2 = testSig("hook write 2");
-    b.settle(write1, write2, &hook);
-    try std.testing.expect(!b.unbuilt(write2));
-    // The mechanism: it is the follow-up's delta that settles it — the
-    // same rebuild with an unknown delta leaves the hook's write pending.
-    var unknown: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer unknown.deinit();
-    unknown.settle(edited, write1, &hook);
-    unknown.settle(write1, write2, null);
-    try std.testing.expect(unknown.unbuilt(write2));
-}
-
-test "watch baseline: an edit saved during the follow-up rebuild stays pending (Codex P2 on #427)" {
-    const hook = testDelta(&.{"assets/out.png"});
-    // The follow-up changed the hook's path AND a source the user saved
-    // after the follow-up had read it.
-    const hook_and_edit = testDelta(&.{ "assets/out.png", "src/main.zig" });
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    const edited = testSig("user edit");
-    const write1 = testSig("hook write 1");
-    b.settle(edited, write1, &hook);
-    try std.testing.expect(b.unbuilt(write1));
-    // Follow-up (fired for `write1`), during which the user saves main.zig.
-    const write2_with_edit = testSig("hook write 2 + edit");
-    b.settle(write1, write2_with_edit, &hook_and_edit);
-    // Not settled: main.zig is new relative to the previous rebuild's
-    // writes, so the tree the follow-up left is still unbuilt and fires
-    // one more rebuild. The old rule accepted it and lost the edit.
-    try std.testing.expect(b.unbuilt(write2_with_edit));
-    try std.testing.expect(b.applied.eql(write1));
-    // That rebuild (fired for exactly the follow-up's post) only rewrites
-    // the hook's path again: a subset, so the chain ends here — (a) still
-    // holds with the edit in it, after exactly one more rebuild.
-    const write3 = testSig("hook write 3");
-    b.settle(write2_with_edit, write3, &hook);
-    try std.testing.expect(!b.unbuilt(write3));
-}
-
-test "watch baseline: a scripted session never settles past an unread edit and never loops" {
-    // A self-writing hook plus user saves landing at every point of the
-    // chain. Each step: the trigger the watcher fired for, and what changed
-    // while that rebuild ran. `must_rebuild` is whether the tree it left
-    // is (correctly) still unbuilt.
-    const Step = struct { trigger: []const u8, post: []const u8, delta: []const u64, must_rebuild: bool };
-    const hook = testDelta(&.{"gen/out.zig"});
-    const hook_a = testDelta(&.{ "gen/out.zig", "src/a.zig" });
-    const hook_b = testDelta(&.{ "gen/out.zig", "src/b.zig" });
-    const none = testDelta(&.{});
-    const a_only = testDelta(&.{"src/a.zig"});
-    const script = [_]Step{
-        // Edit 1; the hook writes; a.zig saved meanwhile -> follow-up.
-        .{ .trigger = "e1", .post = "p1", .delta = &hook_a, .must_rebuild = true },
-        // Follow-up; b.zig saved during it -> one more.
-        .{ .trigger = "p1", .post = "p2", .delta = &hook_b, .must_rebuild = true },
-        // One more: only the hook's path -> settled.
-        .{ .trigger = "p2", .post = "p3", .delta = &hook, .must_rebuild = false },
-        // A later ordinary edit, with a save of a.zig during it and no
-        // self-write -> the next rebuild reads a.zig...
-        .{ .trigger = "e2", .post = "p4", .delta = &a_only, .must_rebuild = true },
-        // ...and writes nothing: built.
-        .{ .trigger = "p4", .post = "p4", .delta = &none, .must_rebuild = false },
-    };
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    for (script) |step| {
-        b.settle(testSig(step.trigger), testSig(step.post), step.delta);
-        try std.testing.expectEqual(step.must_rebuild, b.unbuilt(testSig(step.post)));
-    }
-}
-
-test "watch baseline: a hook writing a different path each run settles at the follow-up cap (Codex P2 on #427)" {
-    // A timestamp-named report: every run writes a NEW path, so no
-    // follow-up's delta is a subset of its predecessor's.
-    const r1 = testDelta(&.{"reports/1.txt"});
-    const r2 = testDelta(&.{"reports/2.txt"});
-    const r3 = testDelta(&.{"reports/3.txt"});
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    b.settle(testSig("edit"), testSig("p1"), &r1);
-    try std.testing.expect(b.unbuilt(testSig("p1")));
-    // Follow-up 1: below the cap, still pending.
-    b.settle(testSig("p1"), testSig("p2"), &r2);
-    try std.testing.expect(b.unbuilt(testSig("p2")));
-    try std.testing.expectEqual(@as(u32, 0), b.capped);
-    // Follow-up 2 reaches the cap: one new path, the writer's footprint,
-    // so it settles — and it was the cap that did it, not the subset rule.
-    try std.testing.expect(!isSubset(&r3, &r2));
-    b.settle(testSig("p2"), testSig("p3"), &r3);
-    try std.testing.expect(!b.unbuilt(testSig("p3")));
-    try std.testing.expectEqual(WatchBaseline.follow_up_cap, b.capped);
-    // The chain is over: the next edit starts a fresh one, with the full
-    // allowance again.
-    b.settle(testSig("edit 2"), testSig("p4"), &r1);
-    try std.testing.expectEqual(@as(u32, 0), b.capped);
-    try std.testing.expect(b.unbuilt(testSig("p4")));
-    b.settle(testSig("p4"), testSig("p5"), &r2);
-    try std.testing.expect(b.unbuilt(testSig("p5")));
-}
-
-test "watch baseline: an edit saved during a capped follow-up still fires one more rebuild" {
-    const r1 = testDelta(&.{"reports/1.txt"});
-    const r2 = testDelta(&.{"reports/2.txt"});
-    // At the cap, the writer's new report AND a source the user saved
-    // while that follow-up ran: more new paths than the writer's footprint.
-    const r3_edit = testDelta(&.{ "reports/3.txt", "src/main.zig" });
-    const r4 = testDelta(&.{"reports/4.txt"});
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    b.settle(testSig("edit"), testSig("p1"), &r1);
-    b.settle(testSig("p1"), testSig("p2"), &r2);
-    b.settle(testSig("p2"), testSig("p3"), &r3_edit);
-    // Not settled: main.zig is read by one more rebuild.
-    try std.testing.expect(b.unbuilt(testSig("p3")));
-    try std.testing.expectEqual(@as(u32, 0), b.capped);
-    // That rebuild only writes the next report: settled past the cap.
-    b.settle(testSig("p3"), testSig("p4"), &r4);
-    try std.testing.expect(!b.unbuilt(testSig("p4")));
-    try std.testing.expectEqual(@as(u32, 3), b.capped);
-}
-
-test "watch baseline: an edit saved between capped-chain rebuilds always rebuilds and restarts the chain" {
-    const r1 = testDelta(&.{"reports/1.txt"});
-    const r2 = testDelta(&.{"reports/2.txt"});
-    const r3 = testDelta(&.{"reports/3.txt"});
-    const r4 = testDelta(&.{"reports/4.txt"});
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    b.settle(testSig("edit"), testSig("p1"), &r1);
-    b.settle(testSig("p1"), testSig("p2"), &r2);
-    // The user saves after follow-up 1 returned: the tree the watcher
-    // fires for is not `p2`, so this is no follow-up and cannot settle...
-    b.settle(testSig("p2 + edit"), testSig("p3"), &r3);
-    try std.testing.expect(b.unbuilt(testSig("p3")));
-    try std.testing.expectEqual(@as(u32, 0), b.follow_ups);
-    // ...and its follow-up is the new chain's first, below the cap.
-    b.settle(testSig("p3"), testSig("p4"), &r4);
-    try std.testing.expect(b.unbuilt(testSig("p4")));
-    try std.testing.expectEqual(@as(u32, 1), b.follow_ups);
-}
-
-/// Drives a writer whose output count keeps growing (run `i` writes `i + 1`
-/// paths nobody wrote before): never within the chain's footprint, so only
-/// the ceiling can end its chains.
-const GrowingWriter = struct {
-    b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator },
-    keys: [512]u64 = undefined,
-    next: usize = 0,
-    run: usize = 0,
-    trigger: TreeSignature = testSig("edit"),
-
-    fn init(self: *GrowingWriter) void {
-        for (&self.keys, 0..) |*k, i| k.* = 1_000_000 + i;
-    }
-
-    fn postOf(run: usize) TreeSignature {
-        var sig = TreeSignature{};
-        sig.mix("post", run, 0);
-        return sig;
-    }
-
-    /// One rebuild; `extra` is a path saved while it ran (or null).
-    /// Returns its post signature.
-    fn step(self: *GrowingWriter, extra: ?u64) !TreeSignature {
-        var delta: [64]u64 = undefined;
-        const count = self.run + 1;
-        @memcpy(delta[0..count], self.keys[self.next .. self.next + count]);
-        self.next += count;
-        var len = count;
-        if (extra) |key| {
-            delta[len] = key;
-            len += 1;
-        }
-        std.mem.sort(u64, delta[0..len], {}, std.sort.asc(u64));
-        const post = postOf(self.run);
-        self.b.settle(self.trigger, post, delta[0..len]);
-        self.trigger = post;
-        self.run += 1;
-        return post;
-    }
-};
-
-test "watch baseline: a writer whose output keeps growing settles at the second ceiling" {
-    var w: GrowingWriter = .{};
-    w.init();
-    defer w.b.deinit();
-    // The first chain: the rebuild plus `follow_up_ceiling` follow-ups.
-    // At its ceiling the writer's new paths are outside the chain's own
-    // outputs, so the tree stays pending and the chain restarts.
-    while (w.run < WatchBaseline.follow_up_ceiling) {
-        try std.testing.expect(w.b.unbuilt(try w.step(null)));
-    }
-    const first_ceiling = try w.step(null);
-    try std.testing.expect(w.b.unbuilt(first_ceiling));
-    try std.testing.expectEqual(@as(u32, 0), w.b.capped);
-    // The fresh chain started by that ceiling reaches it again: the last
-    // bound settles it, so the writer cannot loop.
-    var follow_up: u32 = 0;
-    while (follow_up < WatchBaseline.follow_up_ceiling) : (follow_up += 1) {
-        try std.testing.expect(w.b.unbuilt(try w.step(null)));
-        try std.testing.expectEqual(follow_up, w.b.follow_ups);
-    }
-    const second_ceiling = try w.step(null);
-    try std.testing.expect(!w.b.unbuilt(second_ceiling));
-    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling, w.b.capped);
-}
-
-test "watch baseline: a source edit saved during the ceiling follow-up stays pending (cli#429)" {
-    var w: GrowingWriter = .{};
-    w.init();
-    defer w.b.deinit();
-    while (w.run < WatchBaseline.follow_up_ceiling) _ = try w.step(null);
-    try std.testing.expectEqual(WatchBaseline.follow_up_ceiling - 1, w.b.follow_ups);
-    // The ceiling follow-up: the writer's paths plus a source the user
-    // saved while it ran. Not settled — the old ceiling marked the whole
-    // post built and the edit was never compiled.
-    const trigger = w.trigger;
-    const with_edit = try w.step(pathKey("src/main.zig"));
-    try std.testing.expect(w.b.unbuilt(with_edit));
-    try std.testing.expect(w.b.applied.eql(trigger));
-    try std.testing.expectEqual(@as(u32, 0), w.b.capped);
-    // The rebuild that reads it is fired for exactly that post, yet starts
-    // a fresh chain instead of counting as a ninth follow-up.
-    _ = try w.step(null);
-    try std.testing.expectEqual(@as(u32, 0), w.b.follow_ups);
-    try std.testing.expect(w.b.after_ceiling);
-}
-
-test "watch baseline: a ceiling follow-up that changed only the chain's own outputs settles" {
-    // `atCeiling` judged directly: every path already in the chain's
-    // `recent` set settles; one outside it leaves the tree pending.
-    const own = testDelta(&.{ "gen/a.zig", "gen/b.zig" });
-    const outside = testDelta(&.{ "gen/a.zig", "src/main.zig" });
-    for ([_]struct { delta: []const u64, settles: bool }{
-        .{ .delta = own[0..1], .settles = true },
-        .{ .delta = &outside, .settles = false },
-    }) |case| {
-        var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-        defer b.deinit();
-        b.recent = try std.testing.allocator.dupe(u64, &own);
-        b.follow_ups = WatchBaseline.follow_up_ceiling;
-        const verdict = b.atCeiling(true, case.delta);
-        try std.testing.expectEqual(if (case.settles) WatchBaseline.Ceiling.settled else .pending, verdict);
-        try std.testing.expectEqual(!case.settles, b.restart_chain);
-    }
-}
-
-test "watch baseline: an edit saved during an ordinary rebuild still fires the next one" {
-    var b: WatchBaseline = .{ .applied = testSig("start"), .allocator = std.testing.allocator };
-    defer b.deinit();
-    const first = testSig("edit 1");
-    // A rebuild that writes nothing into the tree; the user saves again
-    // while it runs, so the tree after the callback is `second`.
-    const second = testSig("edit 2");
-    const edit = testDelta(&.{"src/main.zig"});
-    b.settle(first, second, &edit);
-    try std.testing.expect(b.unbuilt(second));
-    // That rebuild (fired for `second`) writes nothing: settled on it.
-    b.settle(second, second, &.{});
-    try std.testing.expect(!b.unbuilt(second));
-    // A later edit is an ordinary trigger again: built at the trigger, so
-    // a save during THIS rebuild is not swallowed either.
-    const third = testSig("edit 3");
-    const fourth = testSig("edit 4");
-    b.settle(third, fourth, &edit);
-    try std.testing.expect(b.unbuilt(fourth));
-}
-
-test "changedPaths: added, removed and changed paths, by key" {
-    const a = std.testing.allocator;
-    var before: TreeSnapshot = .{};
-    defer before.paths.deinit(a);
-    before.record(a, "keep", 1, 1);
-    before.record(a, "edit", 1, 1);
-    before.record(a, "gone", 1, 1);
-    before.sort();
-    var after: TreeSnapshot = .{};
-    defer after.paths.deinit(a);
-    after.record(a, "keep", 1, 1);
-    after.record(a, "edit", 1, 2);
-    after.record(a, "new", 1, 1);
-    after.sort();
-    const delta = try changedPaths(a, before.paths.items, after.paths.items);
-    defer a.free(delta);
-    const expected = testDelta(&.{ "edit", "gone", "new" });
-    try std.testing.expectEqualSlices(u64, &expected, delta);
-    try std.testing.expect(isSubset(&testDelta(&.{"edit"}), delta));
-    try std.testing.expect(!isSubset(&testDelta(&.{ "edit", "keep" }), delta));
-    // The snapshot's signature is the one the polls compute.
-    var sig = TreeSignature{};
-    sig.mix("keep", 1, 1);
-    sig.mix("edit", 1, 2);
-    sig.mix("new", 1, 1);
-    try std.testing.expect(sig.eql(after.sig));
-}
-
 test "resolveTarget: hides shell provenance and path aliases" {
     try std.testing.expect(resolveTarget("/.labelle-shell-state.json") == null);
     try std.testing.expect(resolveTarget("/./.labelle-shell-state.json?cache=1") == null);
@@ -1785,39 +999,10 @@ test "handleConnection: root 404s when neither a shell nor game.html exists" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "404") != null);
 }
 
-// ── Watch / live-reload tests (cli#208) ──────────────────────────────
-
-test "shouldRebuild: fires only after quiet_polls stable ticks with unbuilt changes" {
-    // Not yet stable enough.
-    try std.testing.expect(!shouldRebuild(true, 1, 2));
-    // Stable long enough + unbuilt → fire.
-    try std.testing.expect(shouldRebuild(true, 2, 2));
-    try std.testing.expect(shouldRebuild(true, 5, 2));
-    // Nothing unbuilt → never fire, however long it's been quiet.
-    try std.testing.expect(!shouldRebuild(false, 9, 2));
-}
-
-test "shouldRebuild: quiet_polls of 0 is clamped to 1 (fires on first stable tick)" {
-    try std.testing.expect(shouldRebuild(true, 1, 0));
-    try std.testing.expect(!shouldRebuild(false, 1, 0));
-}
-
-test "skipWatchDir: skips dot-dirs and build output, keeps source dirs" {
-    try std.testing.expect(skipWatchDir(".labelle"));
-    try std.testing.expect(skipWatchDir(".git"));
-    try std.testing.expect(skipWatchDir(".zig-cache"));
-    try std.testing.expect(skipWatchDir("zig-out"));
-    try std.testing.expect(skipWatchDir("zig-pkg"));
-    try std.testing.expect(!skipWatchDir("scenes"));
-    try std.testing.expect(!skipWatchDir("prefabs"));
-    try std.testing.expect(!skipWatchDir("assets"));
-    try std.testing.expect(!skipWatchDir("src"));
-}
-
 test "injectReloadScript: splices before </body>" {
     const alloc = std.testing.allocator;
     const html = "<html><body><canvas></canvas></body></html>";
-    const out = try injectReloadScript(alloc, html);
+    const out = try injectReloadScript(alloc, html, 0);
     defer alloc.free(out);
     // The client script is present...
     try std.testing.expect(std.mem.indexOf(u8, out, "__labelle_livereload") != null);
@@ -1832,173 +1017,183 @@ test "injectReloadScript: splices before </body>" {
 test "injectReloadScript: appends when there is no </body>" {
     const alloc = std.testing.allocator;
     const html = "<h1>bare fragment</h1>";
-    const out = try injectReloadScript(alloc, html);
+    const out = try injectReloadScript(alloc, html, 0);
     defer alloc.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "<h1>bare fragment</h1>"));
     try std.testing.expect(std.mem.indexOf(u8, out, "__labelle_livereload") != null);
 }
+/// One GET through `handleConnection` on its own thread; returns the response.
+fn testGet(io: std.Io, alloc: std.mem.Allocator, server: *std.Io.net.Server, port: u16, web_dir: []const u8, state: ?*WatchState, target: []const u8) ![]u8 {
+    const t = try std.Thread.spawn(.{}, testServeNWatch, .{ io, alloc, server, web_dir, @as(?[]const u8, null), @as(usize, 1), state });
+    defer t.join();
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    const s = try peer.connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{target});
+    try w.interface.flush();
+    var rbuf: [8192]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    return r.interface.allocRemaining(alloc, .unlimited);
+}
 
-test "computeSignature: changes on add, edit, and remove" {
+fn testBody(resp: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return resp;
+    return resp[at + 4 ..];
+}
+
+test "handleConnection: a watch session seeds the reload client with the served generation" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer alloc.free(dir_path);
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "one" });
-
-    var base = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &base);
-    try std.testing.expectEqual(@as(u64, 1), base.file_count);
-
-    // Add a file → count + digest change.
-    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "twelve!" });
-    var after_add = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &after_add);
-    try std.testing.expect(!base.eql(after_add));
-    try std.testing.expectEqual(@as(u64, 2), after_add.file_count);
-
-    // Edit a file in place, changing its SIZE. Keeping the file count the
-    // same, the size component of the per-file digest flips regardless of
-    // mtime — deterministic on every platform (no dependency on the OS
-    // giving the edited file a distinguishable mtime, which is coarse/
-    // coalesced on Windows).
-    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "twelve!-longer" });
-    var after_edit = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &after_edit);
-    try std.testing.expectEqual(after_add.file_count, after_edit.file_count);
-    try std.testing.expect(!after_add.eql(after_edit));
-
-    // Remove a file → back down to one entry, different from every prior sig.
-    try tmp.dir.deleteFile(io, "b.txt");
-    var after_rm = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &after_rm);
-    try std.testing.expectEqual(@as(u64, 1), after_rm.file_count);
-    try std.testing.expect(!after_rm.eql(after_add));
-}
-
-test "TreeSignature: a same-size edit to a NON-newest file still flips the signature" {
-    // Regression for the codex finding: a summed-size + single-newest-mtime
-    // signature misses a same-size edit to a file that isn't the newest.
-    // Two files; the second (mtime 200) is the newest. Edit the first to the
-    // SAME size (10 bytes) with a new mtime that is still older than the
-    // newest (150 < 200) — total size (30) and the newest mtime (200) are
-    // both unchanged, so the old scheme would report "no change". The
-    // per-file digest catches it.
-    var before = TreeSignature{};
-    before.mix("old.txt", 10, 100);
-    before.mix("new.txt", 20, 200);
-
-    var after = TreeSignature{};
-    after.mix("old.txt", 10, 150); // same size, newer mtime, still not newest
-    after.mix("new.txt", 20, 200);
-
-    try std.testing.expectEqual(before.file_count, after.file_count);
-    try std.testing.expect(!before.eql(after));
-}
-
-test "computeSignature: a same-size in-place edit triggers a rebuild" {
-    // Windows FS mtime granularity/update timing makes real-FS same-size-edit
-    // detection non-deterministic in CI; the deterministic coverage is the
-    // in-memory `TreeSignature.mix` test above.
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer alloc.free(dir_path);
-
-    // Two files; `b.txt` is written last (newest). Editing the OLDER `a.txt`
-    // to the same length is the case the naive signature missed.
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "aaaa" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bbbb" });
-
-    var applied = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &applied);
-
-    // Same 4-byte length, different content → only the mtime moves. On
-    // macOS/Linux the write bumps the file's mtime to a distinguishable
-    // value, so the (path,size,mtime) digest flips.
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "AAAA" });
-    var now = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &now);
-
-    try std.testing.expectEqual(applied.file_count, now.file_count);
-    try std.testing.expect(!applied.eql(now));
-    // …and that unbuilt delta drives a rebuild once it's held steady.
-    try std.testing.expect(shouldRebuild(!now.eql(applied), 2, 2));
-}
-
-test "computeSignature: skips .labelle build-output dir (no self-trigger)" {
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer alloc.free(dir_path);
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "scene.zon", .data = "source" });
-    var before = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &before);
-
-    // Simulate a rebuild writing into .labelle/ — the signature must not move.
-    try tmp.dir.createDirPath(io, ".labelle/raylib_wasm");
-    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/raylib_wasm/out.wasm", .data = "artifact" });
-    var after = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &after);
-    try std.testing.expect(before.eql(after));
-}
-
-test "handleConnection: --watch answers the version endpoint and injects the reload client" {
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-
-    var build_tmp = std.testing.tmpDir(.{});
-    defer build_tmp.cleanup();
-    const web_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &build_tmp.sub_path });
-    defer alloc.free(web_dir);
-    try build_tmp.dir.writeFile(io, .{
-        .sub_path = "index.html",
-        .data = "<html><body><canvas id=game></canvas></body></html>",
-    });
-
-    var wstate = WatchState{};
-    _ = wstate.version.fetchAdd(7, .release);
+    try tmp.dir.createDirPath(io, "out/web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/web/index.html", .data = "<html><body><canvas id=game></canvas></body></html>" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const out = try std.fs.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(out);
+    const gen = try std.fs.path.join(alloc, &.{ root, "generation" });
+    defer alloc.free(gen);
+    var wstate = WatchState{ .session = .{ .generation_file = gen, .output_dir = out } };
+    wstate.version.store(1, .release);
 
     const bound = testBindFreePort(io) orelse return error.NoFreePort;
     var server = bound.server;
-    const port = bound.port;
     defer server.deinit(io);
 
-    const t = try std.Thread.spawn(.{}, testServeNWatch, .{ io, alloc, &server, web_dir, @as(?[]const u8, null), @as(usize, 2), &wstate });
-    defer t.join();
+    // The page is served at generation 1 and says so.
+    const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "var current = \"1\";") != null);
+    // The race: generation 2 is published before the page's first poll.
+    wstate.version.store(2, .release);
+    const polled = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
+    defer alloc.free(polled);
+    try std.testing.expectEqualStrings("2", testBody(polled));
+    // The client compares with its seed, never adopts the first answer as
+    // its baseline: "2" !== "1" reloads the page.
+    try std.testing.expect(std.mem.indexOf(u8, page, "current === null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "if (v !== current) { location.reload(); return; }") != null);
+}
 
-    const peer = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    const Case = struct { target: []const u8, want: []const u8 };
-    for ([_]Case{
-        // Version endpoint reflects the current build version.
-        .{ .target = "/__labelle_livereload", .want = "7" },
-        // The root HTML gets the reload client spliced in.
-        .{ .target = "/", .want = "__labelle_livereload" },
+test "handleConnection: run options reach the page first in <head>; the endpoint stays a file outside watch" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "<!doctype html><html><HEAD lang=en><script>var Module={};</script></head><body></body></html>" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "__labelle_livereload", .data = "asset" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const script = (try runEnvScript(alloc, &.{ .{ .name = "LABELLE_SCENE", .value = "intro</script>" }, .{ .name = "LABELLE_PROFILE", .value = "1" } })).?;
+    defer alloc.free(script);
+    var wstate = WatchState{ .run_env_script = script };
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+
+    const page = try testGet(io, alloc, &server, bound.port, root, &wstate, "/");
+    defer alloc.free(page);
+    const env_at = std.mem.indexOf(u8, page, "window.LABELLE_RUN_ENV = {\"LABELLE_SCENE\":\"intro\\u003c/script>\",\"LABELLE_PROFILE\":\"1\"};").?;
+    try std.testing.expect(env_at > std.mem.indexOf(u8, page, "<HEAD lang=en>").?);
+    try std.testing.expect(env_at < std.mem.indexOf(u8, page, "var Module={}").?);
+    try std.testing.expect(std.mem.indexOf(u8, page, "location.reload") == null);
+    const asset = try testGet(io, alloc, &server, bound.port, root, &wstate, "/__labelle_livereload");
+    defer alloc.free(asset);
+    try std.testing.expectEqualStrings("asset", testBody(asset));
+}
+
+test "runEnvScript: no `<` reaches the script element, whatever its case" {
+    const alloc = std.testing.allocator;
+    const script = (try runEnvScript(alloc, &.{.{ .name = "LABELLE_SCENE", .value = "a</ScRiPt><!--b" }})).?;
+    defer alloc.free(script);
+    const body = script["<script>".len..std.mem.lastIndexOf(u8, script, "</script>").?];
+    try std.testing.expect(std.mem.indexOfScalar(u8, body, '<') == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"a\\u003c/ScRiPt>\\u003c!--b\"") != null);
+    // And it is still the same string once parsed as JSON.
+    const start = std.mem.indexOf(u8, body, "{").?;
+    const json = body[start .. std.mem.indexOf(u8, body, "};").? + 1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a</ScRiPt><!--b", parsed.value.object.get("LABELLE_SCENE").?.string);
+}
+
+test "tagEnd skips comments, matches whole names in any case, allows attributes" {
+    const html = "<!doctype html><!-- <head> old --><HTML><header x=1></header><Head data-x=\"a>b\">T</head>";
+    const at = tagEnd(html, "head").?;
+    try std.testing.expectEqualStrings("T</head>", html[at..]);
+    try std.testing.expectEqual(@as(?usize, null), tagEnd("<!-- <head> -->", "head"));
+    try std.testing.expectEqual(@as(?usize, null), tagEnd("<p><!-- unterminated <head>", "head"));
+    const alloc = std.testing.allocator;
+    const got = try injectFirst(alloc, "<!-- <head> --><html><head><title>t</title></head></html>", "S");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("<!-- <head> --><html><head>S<title>t</title></head></html>", got);
+    const bare = try injectFirst(alloc, "<!-- <head> --><p>x</p>", "S");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("S<!-- <head> --><p>x</p>", bare);
+}
+
+test "injectFirst: after <head>, else <body>, else at the start; never inside <header>" {
+    const alloc = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "<html><head><title>t</title></head></html>", "<html><head>S<title>t</title></head></html>" },
+        .{ "<html><body class=x><header>h</header></body></html>", "<html><body class=x>S<header>h</header></body></html>" },
+        .{ "<p>fragment</p>", "S<p>fragment</p>" },
     }) |case| {
+        const got = try injectFirst(alloc, case[0], "S");
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+    try std.testing.expectEqual(@as(?[]u8, null), try runEnvScript(alloc, &.{}));
+}
+
+test "handleConnection: a watch session serves the publication output_dir names, never web_dir" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // symlinks need a privilege; the e2e covers junctions
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "published-0/web");
+    try tmp.dir.createDirPath(io, "published-1/web");
+    try tmp.dir.createDirPath(io, "staging/web");
+    try tmp.dir.writeFile(io, .{ .sub_path = "published-0/web/data.txt", .data = "gen-zero" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "published-1/web/data.txt", .data = "gen-one" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "staging/web/data.txt", .data = "half-built" });
+    try tmp.dir.symLink(io, "published-0", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const current = try std.fs.path.join(alloc, &.{ root, "current" });
+    defer alloc.free(current);
+    const staging = try std.fs.path.join(alloc, &.{ root, "staging", "web" });
+    defer alloc.free(staging);
+    var wstate = WatchState{ .session = .{ .generation_file = current, .output_dir = current } };
+
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var server = bound.server;
+    defer server.deinit(io);
+    const peer = std.Io.net.IpAddress.parse("127.0.0.1", bound.port) catch unreachable;
+    for ([_][]const u8{ "gen-zero", "gen-one" }, 0..) |want, n| {
+        if (n == 1) {
+            // The CLI publishes by renaming a new link over `current`.
+            try tmp.dir.symLink(io, "published-1", "next", .{ .is_directory = true });
+            try tmp.dir.rename("next", tmp.dir, "current", io);
+        }
+        const t = try std.Thread.spawn(.{}, testServeNWatch, .{ io, alloc, &server, staging, @as(?[]const u8, null), @as(usize, 1), &wstate });
+        defer t.join();
         const s = try peer.connect(io, .{ .mode = .stream });
         defer s.close(io);
-        var wbuf: [512]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
         var w = s.writer(io, &wbuf);
-        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{case.target});
+        try w.interface.print("GET /data.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{});
         try w.interface.flush();
-
-        var rbuf: [8192]u8 = undefined;
+        var rbuf: [4096]u8 = undefined;
         var r = s.reader(io, &rbuf);
         const resp = try r.interface.allocRemaining(alloc, .unlimited);
         defer alloc.free(resp);
-        try std.testing.expect(std.mem.indexOf(u8, resp, case.want) != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, want) != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "half-built") == null);
     }
 }
 
@@ -2021,155 +1216,6 @@ test "handleConnection: without --watch, HTML is served untouched and the endpoi
     try std.testing.expect(std.mem.indexOf(u8, resp, "__labelle_livereload") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "plain") != null);
 }
-
-// The watch-mode double rebuild (cli#355 review round 2): a prebuild hook
-// regenerates a non-hidden output, `watchLoop` records the signature it
-// captured BEFORE the callback, and the next poll sees the hook's own
-// write as a fresh change — a second full generate/compile/browser-reload
-// for a step that is now up to date.
-test "computeSignature: a declared prebuild output does not move the signature" {
-    const io = config.globalIo();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir_path = buf[0..try tmp.dir.realPath(io, &buf)];
-    const alloc = std.testing.allocator;
-
-    try tmp.dir.createDirPath(io, "assets");
-    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 1;" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v1" });
-
-    const ignored = try watchIgnorePath(alloc, dir_path, "assets/out.png");
-    defer alloc.free(ignored);
-    const ignore_files = [_][]const u8{ignored};
-
-    var before = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &ignore_files, &before);
-
-    // The hook regenerates its declared output — a different size AND a
-    // later mtime, which is what the naive signature keyed on.
-    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v2-regenerated" });
-
-    var after = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &ignore_files, &after);
-    try std.testing.expect(before.eql(after));
-
-    // ...while an edit to a watched SOURCE still fires.
-    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 2222;" });
-    var edited = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &ignore_files, &edited);
-    try std.testing.expect(!before.eql(edited));
-    // And without the exclusion the regeneration DOES move it — the bug.
-    var unfiltered_before = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &unfiltered_before);
-    try tmp.dir.writeFile(io, .{ .sub_path = "assets/out.png", .data = "v3-regenerated-again" });
-    var unfiltered_after = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &unfiltered_after);
-    try std.testing.expect(!unfiltered_before.eql(unfiltered_after));
-}
-
-test "watchIgnorePath: roots a declared output the way the walk builds paths" {
-    // POSIX-only: the expected strings spell the separator. The behavior
-    // under test (a leading `./` must still match the walked path) is
-    // separator-agnostic, and the tree-level test above covers it on
-    // every platform.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-
-    const plain = try watchIgnorePath(alloc, "/proj", "assets/out.png");
-    defer alloc.free(plain);
-    try std.testing.expectEqualStrings("/proj/assets/out.png", plain);
-
-    // A leading `./` in the declaration must still match the walked path.
-    const dotted = try watchIgnorePath(alloc, "/proj", "./assets/out.png");
-    defer alloc.free(dotted);
-    try std.testing.expectEqualStrings("/proj/assets/out.png", dotted);
-}
-
-test "skipWatchFile: matches only the declared outputs" {
-    const ignore_files = [_][]const u8{ "/proj/assets/out.png", "/proj/scripts/table.zig" };
-    try std.testing.expect(skipWatchFile("/proj/assets/out.png", &ignore_files));
-    try std.testing.expect(skipWatchFile("/proj/scripts/table.zig", &ignore_files));
-    try std.testing.expect(!skipWatchFile("/proj/assets/out.json", &ignore_files));
-    try std.testing.expect(!skipWatchFile("/proj/game.zig", &ignore_files));
-    try std.testing.expect(!skipWatchFile("/proj/assets/out.png", &.{}));
-}
-
-// #371: the same nested-checkout gap `labelle test` had. `skipWatchDir`'s
-// dot rule only hides a checkout whose own folder starts with a dot; a
-// worktree parked under a plain name folded a whole second copy of the
-// project into the signature, so edits on an unrelated branch fired
-// rebuilds here. The fixtures write the `.git` markers by hand (no `git`
-// invocation) so they run on the ubuntu and windows CI runners too.
-test "computeSignature: nested git checkouts are pruned, ordinary dirs are not" {
-    const io = config.globalIo();
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir_path = buf[0..try tmp.dir.realPath(io, &buf)];
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "game.zig", .data = "const a = 1;" });
-
-    var base = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &base);
-    try std.testing.expectEqual(@as(u64, 1), base.file_count);
-
-    // A linked worktree: `.git` is a FILE holding a `gitdir:` pointer,
-    // so a kind check would miss it.
-    try tmp.dir.createDirPath(io, "verify-821/libs/ui_kit");
-    try tmp.dir.writeFile(io, .{ .sub_path = "verify-821/libs/ui_kit/root.zig", .data = "stale" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "verify-821/.git", .data = "gitdir: /somewhere\n" });
-
-    var with_worktree = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &with_worktree);
-    try std.testing.expect(base.eql(with_worktree));
-
-    // A plain nested clone: `.git` is a DIRECTORY. Pruned too.
-    try tmp.dir.createDirPath(io, "vendor/other/.git");
-    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/other/main.zig", .data = "stale" });
-
-    var with_clone = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &with_clone);
-    try std.testing.expect(base.eql(with_clone));
-
-    // ...but an ordinary directory that merely *looks* like a worktree
-    // parent still counts: the prune keys on the marker, not the name.
-    try tmp.dir.createDirPath(io, "worktrees");
-    try tmp.dir.writeFile(io, .{ .sub_path = "worktrees/helper.zig", .data = "real source" });
-
-    var with_plain_dir = TreeSignature{};
-    computeSignature(io, alloc, dir_path, &.{}, &with_plain_dir);
-    try std.testing.expect(!base.eql(with_plain_dir));
-    try std.testing.expectEqual(@as(u64, 2), with_plain_dir.file_count);
-}
-
-test "isNestedCheckout: keys on the .git marker's existence, not its kind" {
-    const io = config.globalIo();
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(io, &buf)];
-
-    try tmp.dir.createDirPath(io, "wt");
-    try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = "gitdir: /elsewhere\n" });
-    try tmp.dir.createDirPath(io, "clone/.git");
-    try tmp.dir.createDirPath(io, "plain/src");
-
-    for ([_]struct { name: []const u8, want: bool }{
-        .{ .name = "wt", .want = true },
-        .{ .name = "clone", .want = true },
-        .{ .name = "plain", .want = false },
-    }) |case| {
-        const p = try std.fs.path.join(alloc, &.{ root, case.name });
-        defer alloc.free(p);
-        try std.testing.expectEqual(case.want, isNestedCheckout(io, alloc, p));
-    }
-}
-
 // A stop request ends the accept loop — the path that makes the `after run`
 // hooks after `serveAndOpen` reachable (Codex P2 on #420). The signal /
 // console handler itself is interactive and is not driven here; the flag
@@ -2225,6 +1271,37 @@ test "serveLoop: returns on a stop request after serving what came before it" {
     // Once set, the loop does not accept at all: a direct call returns
     // without touching the listener (nobody connects here).
     serveLoop(io, alloc, &server, web_dir, null, null, &cancel);
+}
+
+test "serveAndOpen: a run timeout stops the server cleanly at the deadline" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bound = testBindFreePort(io) orelse return error.NoFreePort;
+    var probe = bound.server;
+    probe.deinit(io);
+    defer cancel_requested.store(false, .release);
+    cancel_requested.store(false, .release);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    // Returns (no error) only because the deadline asked for the stop.
+    try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300);
+    const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try std.testing.expect(cancel_requested.load(.acquire));
+    try std.testing.expect(elapsed >= 300);
+    try std.testing.expect(elapsed < 10_000);
+}
+
+test "deadlineLoop: sets the stop flag after the deadline, not when stopped first" {
+    const io = std.testing.io;
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var stop: std.atomic.Value(bool) = .init(true);
+    deadlineLoop(io, 10_000, &cancel, &stop);
+    try std.testing.expect(!cancel.load(.acquire));
+    stop.store(false, .release);
+    deadlineLoop(io, 30, &cancel, &stop);
+    try std.testing.expect(cancel.load(.acquire));
 }
 
 test "wakeLoop: pokes the listener once the flag is set and ends on stop without one" {
