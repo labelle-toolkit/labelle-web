@@ -81,7 +81,24 @@ pub const Runner = struct {
 
 pub const system: Runner = .{ .step = systemStep, .capture = systemCapture };
 
-fn systemStep(_: ?*anyopaque, io: std.Io, _: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!u8 {
+fn systemStep(_: ?*anyopaque, io: std.Io, a: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) anyerror!u8 {
+    if (is_windows) {
+        // Handing the stderr handle to a Windows child as its stdout failed
+        // with NoDevice on windows-latest; capture (as the CLI's own emsdk
+        // steps did) and relay both streams to stderr afterwards.
+        const result = try std.process.run(a, io, .{ .argv = argv, .cwd = if (cwd) |c| .{ .path = c } else .inherit });
+        defer a.free(result.stdout);
+        defer a.free(result.stderr);
+        var buf: [4096]u8 = undefined;
+        var w = stdio.stderrWriter(io, &buf);
+        w.interface.writeAll(result.stdout) catch {};
+        w.interface.writeAll(result.stderr) catch {};
+        w.interface.flush() catch {};
+        return switch (result.term) {
+            .exited => |code| code,
+            else => 255,
+        };
+    }
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd) |c| .{ .path = c } else .inherit,
