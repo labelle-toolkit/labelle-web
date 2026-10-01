@@ -98,6 +98,7 @@ pub fn serveAndOpen(
     session: ?watch.Session,
     run_env: []const RunEnv,
     timeout_ms: ?u64,
+    isolate: bool,
 ) !Ending {
     const io = config.globalIo();
 
@@ -105,7 +106,7 @@ pub fn serveAndOpen(
     // launched this replacement (0), read before the first request.
     const env_script = try runEnvScript(allocator, run_env);
     defer if (env_script) |e| allocator.free(e);
-    var wstate = WatchState{ .session = session, .run_env_script = env_script };
+    var wstate = WatchState{ .session = session, .run_env_script = env_script, .isolate = isolate };
     if (session) |s| {
         const initial = (try watch.readGeneration(io, s.generation_file)) orelse return error.MissingWatchGeneration;
         wstate.version.store(initial, .release);
@@ -148,17 +149,19 @@ pub fn serveAndOpen(
         wstate.stop.store(true, .release);
         t.join();
     };
-    const watch_state: ?*WatchState = if (session != null or env_script != null) &wstate else null;
+    const watch_state: ?*WatchState = if (session != null or env_script != null or isolate) &wstate else null;
 
     std.debug.print(
         "labelle-web: serving {s}\n" ++
             "  Local:   http://127.0.0.1:{d}\n" ++
+            "{s}" ++
             "{s}" ++
             "  Press Ctrl+C to stop\n",
         .{
             if (session) |s| s.output_dir else web_dir,
             port,
             if (session != null) "  Watch session: labelle rebuilds on change; this page reloads after each successful build\n" else "",
+            if (isolate) "  Threads: served cross-origin isolated (COOP/COEP); a deployed host must send the same headers\n" else "",
         },
     );
 
@@ -292,7 +295,7 @@ test "serveAndOpen: a run timeout stops the server cleanly at the deadline" {
     const started = std.Io.Clock.Timestamp.now(io, .awake);
     // Returns (no error) only because the deadline asked for the stop, and
     // says so.
-    try std.testing.expectEqual(Ending.timed_out, try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300));
+    try std.testing.expectEqual(Ending.timed_out, try serveAndOpen(std.testing.allocator, root, null, bound.port, false, null, &.{}, 300, false));
     const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
     try std.testing.expect(cancel_requested.load(.acquire));
     try std.testing.expect(elapsed >= 300);

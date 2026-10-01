@@ -110,7 +110,7 @@ fn execute(init: std.process.Init) !void {
         if (!std.mem.eql(u8, ctx.target.?, "wasm")) return error.UnsupportedTarget;
         const step = ctx.invocation.step.?;
         const phase = ctx.invocation.phase.?;
-        if (is(id, "toolchain") and step == .generate and phase == .before) return hookToolchain(a, io, ctx, inputs);
+        if (is(id, "toolchain") and step == .generate and phase == .before) return hookToolchain(a, io, ctx, inputs, settings.threads);
         if (is(id, "toolchain-package") and step == .generate and phase == .after) return hookToolchainPackage(a, io, ctx, inputs);
         if (is(id, "shell") and step == .build and phase == .after) return webAction(init, ctx, settings, .{}, .stage);
         if (is(id, "serve") and step == .run and phase == .replace) {
@@ -188,18 +188,29 @@ fn requirePython(a: std.mem.Allocator, io: std.Io) ![]const u8 {
     }
 }
 
+/// The generation switch a `"threads": true` project contributes: the
+/// assembler generates the threaded web build (labelle-assembler#818).
+/// Reaches the assembler only on a CLI that applies `before generate`
+/// environment to generation (labelle-cli#525).
+pub const threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value = "1" };
+
 /// `before generate`: resolve (and, managed, provision) the emsdk and
-/// contribute it, so the fingerprint pass and the compile both see it.
-fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs) !void {
+/// contribute it, so the fingerprint pass and the compile both see it. A
+/// threaded project also contributes `threads_var`, which the generation
+/// itself reads.
+fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs, threads: bool) !void {
     var in = inputs;
     in.python = try requirePython(a, io);
+    const extra: []const emsdk.EnvVar = if (threads) &.{threads_var} else &.{};
+    if (threads) std.debug.print("labelle-web: threads: generating the threaded web build (serve it cross-origin isolated)\n", .{});
     const resolved = (try emsdk.ensure(a, io, emsdk.system, in)) orelse {
         std.debug.print("labelle-web: emsdk.source is \"package\": the fetched emsdk is activated after generation\n", .{});
+        if (threads) try emsdk.writeVarsOnly(a, io, ctx.env_file.?, extra);
         return;
     };
     const r = resolved.ready;
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ r.source.label(), r.root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root, in.python);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root, in.python, extra);
 }
 
 /// `after generate`: package mode only. Activate every fetched
@@ -210,7 +221,7 @@ fn hookToolchainPackage(a: std.mem.Allocator, io: std.Io, ctx: contract.Context,
     const python = try requirePython(a, io);
     const root = try emsdk.activatePackages(a, io, emsdk.system, ctx.target_dir.?, in.cache_dir, in.version(), in.offline, python);
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ emsdk.Source.package.label(), root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root, python);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root, python, &.{});
 }
 
 /// `labelle web toolchain which|install [<version>]`.
@@ -284,7 +295,7 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try checkRuntime(io, web);
     try exporter.validateBuildTree(io, std.Io.Dir.cwd(), web);
     const port = opts.port orelse settings.port;
-    const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms);
+    const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms, settings.threads);
     try reportEnding(io, ending, opts.outcome_file);
 }
 
@@ -342,7 +353,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
                 // Serve the stamped copy, never the original placeholder-bearing source.
-                const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms);
+                const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms, settings.threads);
                 try reportEnding(io, ending, opts.outcome_file);
             }
         },

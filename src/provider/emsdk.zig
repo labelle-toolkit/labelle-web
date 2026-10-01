@@ -240,6 +240,7 @@ pub const selectedTargetDir = package_mod.selectedTargetDir;
 pub const Contribution = env_mod.Contribution;
 pub const contribution = env_mod.contribution;
 pub const writeEnvFile = env_mod.writeEnvFile;
+pub const writeVarsOnly = env_mod.writeVarsOnly;
 pub const wasmOptPath = env_mod.wasmOptPath;
 pub const PythonCheck = python_mod.PythonCheck;
 pub const checkPython = python_mod.checkPython;

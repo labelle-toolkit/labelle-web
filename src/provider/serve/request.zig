@@ -72,6 +72,13 @@ fn cancelConnection(io: std.Io, stream: std.Io.net.Stream, cancel: *const std.at
     }
 }
 
+/// The cross-origin isolation a threaded build needs: COOP `same-origin` and
+/// COEP `require-corp` (Safari has no `credentialless`).
+pub const isolation_headers = [_]std.http.Header{
+    .{ .name = "cross-origin-opener-policy", .value = "same-origin" },
+    .{ .name = "cross-origin-embedder-policy", .value = "require-corp" },
+};
+
 /// Serve a single HTTP/1.1 request off `stream`, then close it.
 /// Connection: close — no keep-alive; the dev loop reopens per asset.
 pub fn handleConnection(
@@ -247,14 +254,19 @@ pub fn handleConnection(
     // `request.respond` omits the body for HEAD requests automatically
     // while still emitting a `content-length` reflecting the real file
     // size, so passing the full `body` is correct for GET and HEAD.
+    const base_headers = [_]std.http.Header{
+        .{ .name = "content-type", .value = content_type },
+        // WASM ships uncompressed and large; spare the browser a
+        // re-fetch across reloads within a dev session.
+        .{ .name = "cache-control", .value = "no-cache" },
+    };
+    // A threaded build (labelle-web#24) needs the page cross-origin isolated,
+    // or the module fails to start (SharedArrayBuffer is withheld).
+    const isolated_headers = base_headers ++ isolation_headers;
+    const isolate = if (watch_state) |ws| ws.isolate else false;
     try request.respond(send_body, .{
         .status = .ok,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = content_type },
-            // WASM ships uncompressed and large; spare the browser a
-            // re-fetch across reloads within a dev session.
-            .{ .name = "cache-control", .value = "no-cache" },
-        },
+        .extra_headers = if (isolate) &isolated_headers else &base_headers,
     });
 }
 
