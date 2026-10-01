@@ -135,5 +135,22 @@
     if (options.fitCanvas === true) fit();
     return module;
   }
-  global.LabelleLoader = { install };
+  /**
+   * Pick which build to load (labelle-web#24): `'threaded/'` when the page is
+   * cross-origin isolated (so SharedArrayBuffer exists) AND an export shipped
+   * a threaded build there; `''` (the build beside the page) otherwise. A
+   * threaded module fails to start without isolation, so the fallback is the
+   * single-threaded build at the root. `labelle run` with threads serves its
+   * threaded build at the root, isolated, so this answers `''` there too.
+   * Calls `done(base)` exactly once; never rejects.
+   */
+  function pickBuild(done) {
+    if (!(global.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') || typeof fetch !== 'function') {
+      done('');
+      return;
+    }
+    fetch('threaded/game.js', { method: 'HEAD', cache: 'no-store' })
+      .then(response => done(response.ok ? 'threaded/' : ''), () => done(''));
+  }
+  global.LabelleLoader = { install, pickBuild };
 })(globalThis);
