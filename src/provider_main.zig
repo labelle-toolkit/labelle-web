@@ -110,9 +110,15 @@ fn execute(init: std.process.Init) !void {
         if (!std.mem.eql(u8, ctx.target.?, "wasm")) return error.UnsupportedTarget;
         const step = ctx.invocation.step.?;
         const phase = ctx.invocation.phase.?;
-        if (is(id, "toolchain") and step == .generate and phase == .before) return hookToolchain(a, io, ctx, inputs);
+        if (is(id, "toolchain") and step == .generate and phase == .before) return hookToolchain(a, io, ctx, inputs, settings.threads);
         if (is(id, "toolchain-package") and step == .generate and phase == .after) return hookToolchainPackage(a, io, ctx, inputs);
-        if (is(id, "shell") and step == .build and phase == .after) return webAction(init, ctx, settings, .{}, .stage);
+        if (is(id, "shell") and step == .build and phase == .after) {
+            if (settings.threads) {
+                try requireThreadedGeneration(a, io, ctx.target_dir.?);
+                try rejectReservedThreaded(io, try std.fs.path.join(a, &.{ ctx.project_dir.?, "web" }));
+            }
+            return webAction(init, ctx, settings, .{}, .stage);
+        }
         if (is(id, "serve") and step == .run and phase == .replace) {
             const run = ctx.run orelse return error.MissingRunContext;
             var opts = try parseOptions(run.args, .serve);
@@ -188,18 +194,32 @@ fn requirePython(a: std.mem.Allocator, io: std.Io) ![]const u8 {
     }
 }
 
+/// The generation switch a `"threads": true` project contributes: the
+/// assembler generates the threaded web build (labelle-assembler#818).
+/// Reaches the assembler only on a CLI that applies `before generate`
+/// environment to generation (labelle-cli#525).
+pub const threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value = "1" };
+/// Contributed when threads are off, so an inherited `LABELLE_WASM_THREADS=1`
+/// can't generate a threaded build the rest of the provider treats as plain.
+pub const no_threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value = "0" };
+
 /// `before generate`: resolve (and, managed, provision) the emsdk and
-/// contribute it, so the fingerprint pass and the compile both see it.
-fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs) !void {
+/// contribute it, so the fingerprint pass and the compile both see it. A
+/// threaded project also contributes `threads_var`, which the generation
+/// itself reads.
+fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs, threads: bool) !void {
     var in = inputs;
     in.python = try requirePython(a, io);
+    const extra: []const emsdk.EnvVar = if (threads) &.{threads_var} else &.{no_threads_var};
+    if (threads) std.debug.print("labelle-web: threads: generating the threaded web build (serve it cross-origin isolated)\n", .{});
     const resolved = (try emsdk.ensure(a, io, emsdk.system, in)) orelse {
         std.debug.print("labelle-web: emsdk.source is \"package\": the fetched emsdk is activated after generation\n", .{});
+        try emsdk.writeVarsOnly(a, io, ctx.env_file.?, extra);
         return;
     };
     const r = resolved.ready;
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ r.source.label(), r.root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root, in.python);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, r.root, in.python, extra);
 }
 
 /// `after generate`: package mode only. Activate every fetched
@@ -210,7 +230,7 @@ fn hookToolchainPackage(a: std.mem.Allocator, io: std.Io, ctx: contract.Context,
     const python = try requirePython(a, io);
     const root = try emsdk.activatePackages(a, io, emsdk.system, ctx.target_dir.?, in.cache_dir, in.version(), in.offline, python);
     std.debug.print("labelle-web: emsdk from {s}: {s}\n", .{ emsdk.Source.package.label(), root });
-    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root, python);
+    try emsdk.writeEnvFile(a, io, ctx.env_file.?, root, python, &.{});
 }
 
 /// `labelle web toolchain which|install [<version>]`.
@@ -284,7 +304,7 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try checkRuntime(io, web);
     try exporter.validateBuildTree(io, std.Io.Dir.cwd(), web);
     const port = opts.port orelse settings.port;
-    const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms);
+    const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, session, opts.run_env, opts.timeout_ms, settings.threads);
     try reportEnding(io, ending, opts.outcome_file);
 }
 
@@ -330,23 +350,158 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             // A source custom-page directory must survive even if it bears an export marker.
             const custom = try canonical(a, io, project_web);
             if (try contains(io, out, custom) or try contains(io, custom, out)) return error.DestructiveOutputPath;
-            try exporter.packageExport(init.gpa, web, project_web, .{
+            // A threaded project ships both builds (owner decision on
+            // labelle-web#24): the threaded one under `threaded/`, the
+            // single-threaded fallback at the root; the page picks
+            // (`LabelleLoader.pickBuild`). Only `labelle bundle` can make the
+            // fallback (it needs the generated tree and the compiler); the
+            // plain export command refuses instead of shipping a threaded
+            // root that a non-isolated host can't start.
+            if (settings.threads and !hook) {
+                std.debug.print(
+                    "labelle-web: \"threads\": true needs both builds in the export; run `labelle bundle --platform=wasm` instead of `labelle web export`\n",
+                    .{},
+                );
+                return error.ThreadedExportNeedsBundle;
+            }
+            const threaded = hook and settings.threads;
+            if (threaded) try rejectReservedThreaded(io, project_web);
+            // The build in `web` is never modified: the export packages a
+            // composed copy (fallback at the root, threaded pair in
+            // `threaded/`), so a later serve or export still has the
+            // threaded build, and a failed fallback build changes nothing.
+            const composed: ?[]const u8 = if (threaded) try composeThreadedExport(init.gpa, a, io, ctx, web) else null;
+            defer if (composed) |dir| cwd.deleteTree(io, dir) catch {};
+            try exporter.packageExport(init.gpa, composed orelse web, project_web, .{
                 .output_dir = out,
                 .zip = opts.zip or settings.@"export".zip,
                 .platform = opts.platform orelse try settings.exportPlatform(),
                 .wasm_opt_fallback = opts.wasm_opt,
             });
+            if (threaded) std.debug.print(
+                "labelle-web: threads: exported threaded/ + a single-threaded fallback; serve with COOP same-origin + COEP require-corp to get the threaded one\n",
+                .{},
+            );
         },
         .stage, .serve => {
+            if (settings.threads) try rejectReservedThreaded(io, project_web);
             try assets.stage(init.gpa, io, web, project_web);
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
                 // Serve the stamped copy, never the original placeholder-bearing source.
-                const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms);
+                const ending = try server.serveAndOpen(init.gpa, web, null, port, settings.open_browser and !opts.no_open, null, opts.run_env, opts.timeout_ms, settings.threads);
                 try reportEnding(io, ending, opts.outcome_file);
             }
         },
     }
+}
+
+/// `"threads": true` only works when the whole chain honours it; otherwise
+/// the build silently comes out single-threaded. A threaded generation
+/// declares the `wasm_threads` build option (labelle-assembler#818), so its
+/// absence means some link is too old: fail with what to upgrade.
+fn requireThreadedGeneration(a: std.mem.Allocator, io: std.Io, target_dir: []const u8) !void {
+    const path = try std.fs.path.join(a, &.{ target_dir, "build.zig" });
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024));
+    if (generatedThreaded(source)) return;
+    std.debug.print(
+        "labelle-web: \"threads\": true, but the generated build is single-threaded.\n" ++
+            "  The threaded web build needs labelle-cli with labelle-cli#525 (before-generate env reaches generation),\n" ++
+            "  labelle-assembler with labelle-assembler#818 and labelle-bgfx with labelle-bgfx#199. Upgrade them, or set \"threads\": false.\n",
+        .{},
+    );
+    return error.ThreadsNotGenerated;
+}
+
+/// True when a generated wasm build.zig is a threaded generation.
+fn generatedThreaded(build_zig: []const u8) bool {
+    return std.mem.indexOf(u8, build_zig, "b.option(bool, \"wasm_threads\"") != null;
+}
+
+test "generatedThreaded: only a threaded generation declares the wasm_threads option" {
+    try std.testing.expect(generatedThreaded("    const wasm_threads = b.option(bool, \"wasm_threads\", \"x\") orelse true;\n"));
+    try std.testing.expect(!generatedThreaded("    const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32 });\n"));
+}
+
+/// Where a threaded export puts the threaded build, beside the fallback.
+const threaded_dir = "threaded";
+/// Written into `threaded/` by a threaded export; `pickBuild` loads the
+/// threaded build only when this exact JSON comes back.
+const threads_marker = "labelle-threads.json";
+const threads_marker_body = "{\"labelle_threads\":1}\n";
+/// The emcc outputs that differ between the two builds.
+const build_outputs = [_][]const u8{ "game.js", "game.wasm" };
+
+/// `threaded/` is where a threaded export (and `pickBuild`) looks for the
+/// threaded build, so a project page dir may not use it: its files would be
+/// copied over the generated glue (labelle-web#25 review).
+fn rejectReservedThreaded(io: std.Io, project_web: []const u8) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, project_web, .{}) catch return;
+    defer dir.close(io);
+    _ = dir.statFile(io, threaded_dir, .{}) catch return;
+    std.debug.print(
+        "labelle-web: \"threads\": true reserves '{s}/' for the threaded build; rename '{s}/{s}' in the project's web directory\n",
+        .{ threaded_dir, project_web, threaded_dir },
+    );
+    return error.ReservedThreadedDirectory;
+}
+
+/// Compose a threaded export's input WITHOUT touching `web` (the CLI's
+/// threaded build): build the single-threaded fallback from the same
+/// generated tree into its own prefix (`zig build --prefix`,
+/// `-Dwasm_threads=false`, labelle-assembler#818), then copy `web` into a
+/// staging dir with the fallback's runtime at the root (stale precompressed
+/// siblings removed) and the original threaded runtime in `threaded/`.
+/// Returns the staging dir; the caller packages it and deletes it.
+fn composeThreadedExport(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, ctx: contract.Context, web: []const u8) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const zig_out = try std.fs.path.join(a, &.{ ctx.target_dir.?, "zig-out" });
+    const prefix = try std.fs.path.join(a, &.{ zig_out, "threads-fallback" });
+    const composed = try std.fs.path.join(a, &.{ zig_out, "threads-export" });
+    // A leftover staging tree that can't be cleared (a locked file on
+    // Windows, say) must stop the export: merging into it would ship files
+    // the current build no longer produces.
+    try cwd.deleteTree(io, prefix);
+    try cwd.deleteTree(io, composed);
+    defer cwd.deleteTree(io, prefix) catch {};
+
+    std.debug.print("labelle-web: threads: building the single-threaded fallback (-Dwasm_threads=false)\n", .{});
+    const optimize = try std.fmt.allocPrint(a, "-Doptimize={s}", .{@tagName(ctx.optimize)});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ ctx.zig_executable, "build", optimize, "-Dwasm_threads=false", "--prefix", prefix },
+        .cwd = .{ .path = ctx.target_dir.? },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    switch (try child.wait(io)) {
+        .exited => |code| if (code != 0) return error.FallbackBuildFailed,
+        else => return error.FallbackBuildFailed,
+    }
+    const fallback = try std.fs.path.join(a, &.{ prefix, "web" });
+    try checkRuntime(io, fallback);
+
+    errdefer cwd.deleteTree(io, composed) catch {};
+    try exporter.copyTreeTo(gpa, io, web, composed);
+    const threaded = try std.fs.path.join(a, &.{ composed, threaded_dir });
+    try cwd.createDirPath(io, threaded);
+    for (build_outputs) |name| {
+        const original = try std.fs.path.join(a, &.{ web, name });
+        try std.Io.Dir.copyFile(cwd, original, cwd, try std.fs.path.join(a, &.{ threaded, name }), io, .{});
+        // The precompressed siblings at the root describe the THREADED
+        // runtime; a host negotiating them would hand a non-isolated client
+        // the module it can't start.
+        for ([_][]const u8{ ".gz", ".br" }) |ext| {
+            cwd.deleteFile(io, try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ composed, name, ext })) catch {};
+        }
+        const root_copy = try std.fs.path.join(a, &.{ composed, name });
+        try std.Io.Dir.copyFile(cwd, try std.fs.path.join(a, &.{ fallback, name }), cwd, root_copy, io, .{});
+    }
+    // The explicit marker `LabelleLoader.pickBuild` looks for: a probe for
+    // `threaded/game.js` alone is fooled by hosts that answer any missing
+    // path with the index page and a 200.
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ threaded, threads_marker }), .data = threads_marker_body });
+    return composed;
 }
 
 /// Find one built target; multi-backend projects must select --input/build_dir.

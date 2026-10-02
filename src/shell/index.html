@@ -43,17 +43,26 @@
   <script src="labelle-loader.js" onerror="labelleShellFail()"></script>
   <script>
     if (window.LabelleLoader) {
-      var Module = LabelleLoader.install(window.Module || {}, {
-        canvas: document.getElementById('canvas'),
-        overlay: document.getElementById('loading'),
-        progress: document.getElementById('loading-progress'),
-        status: document.getElementById('loading-status'),
-        fitCanvas: true // The viewport CSS above is independent of buffer size.
+      // A threaded export ships `threaded/` next to the single-threaded
+      // build; `pickBuild` loads it only where the page is cross-origin
+      // isolated (labelle-web#24). Otherwise base is '' and nothing changes.
+      LabelleLoader.pickBuild(function (base) {
+        var Module = window.Module = LabelleLoader.install(window.Module || {}, {
+          canvas: document.getElementById('canvas'),
+          overlay: document.getElementById('loading'),
+          progress: document.getElementById('loading-progress'),
+          status: document.getElementById('loading-status'),
+          wasmURL: base ? base + 'game.wasm' : undefined,
+          // data-wasm-bytes is the root (fallback) module's size; the
+          // threaded one differs, so show indeterminate progress for it.
+          wasmBytes: base ? 0 : undefined,
+          fitCanvas: true // The viewport CSS above is independent of buffer size.
+        });
+        var gameScript = document.createElement('script');
+        gameScript.src = base + 'game.js';
+        gameScript.onerror = function () { Module.labelleLoader.fail(new Error('Could not download game.js')); };
+        document.body.appendChild(gameScript);
       });
-      var gameScript = document.createElement('script');
-      gameScript.src = 'game.js';
-      gameScript.onerror = function () { Module.labelleLoader.fail(new Error('Could not download game.js')); };
-      document.body.appendChild(gameScript);
     } else {
       labelleShellFail();
     }

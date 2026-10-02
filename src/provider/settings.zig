@@ -6,8 +6,13 @@
 //! ```json
 //! { "schema_version": 1, "port": 8080, "open_browser": true, "build_dir": null,
 //!   "emsdk": { "version": "4.0.9", "source": "managed", "root": null },
-//!   "export": { "platform": "none", "zip": false } }
+//!   "export": { "platform": "none", "zip": false }, "threads": false }
 //! ```
+//!
+//! `threads` (labelle-web#24) opts into the threaded web build (Emscripten
+//! pthreads): `labelle run`/serve build and serve it cross-origin isolated,
+//! and the export ships it next to a single-threaded fallback that the page
+//! picks when the host can't isolate it.
 const std = @import("std");
 const exporter = @import("export.zig");
 
@@ -48,6 +53,8 @@ pub const Settings = struct {
     build_dir: ?[]const u8 = null,
     emsdk: Emsdk = .{},
     @"export": Export = .{},
+    /// Threaded web build (labelle-web#24). See the file comment.
+    threads: bool = false,
 
     pub fn exportPlatform(self: Settings) !exporter.Platform {
         if (std.mem.eql(u8, self.@"export".platform, "none")) return .none;

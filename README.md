@@ -101,8 +101,11 @@ canvas backing attributes (for example, `width: 100vw; height: 100dvh`). The
 default shell supplies that CSS and explicitly enables fitting. URLs resolve relative to the document; pass an
 explicit URL/prefix for CDN/subdirectory glue. `Module.labelleLoader.dispose()`
 stops canvas fitting when a custom page removes the game. This hook supports
-classic Emscripten `Module` builds, not modularized factories/ES modules or
-pthread worker bootstrap.
+classic Emscripten `Module` builds, not modularized factories/ES modules.
+Threaded builds (`"threads": true`) work: Emscripten's workers load `game.js`
+themselves. A custom page that should pick the threaded export where it can
+calls `LabelleLoader.pickBuild(function (base) { ... })` first and loads
+`base + 'game.js'` with `wasmURL: base + 'game.wasm'` (see `src/shell/index.html`).
 
 ### Provider integration boundary
 
@@ -301,7 +304,7 @@ Only `schema_version` is required; the other values shown are the defaults:
 ```json
 { "schema_version": 1, "port": 8080, "open_browser": true, "build_dir": null,
   "emsdk": { "version": "4.0.9", "source": "managed", "root": null },
-  "export": { "platform": "none", "zip": false } }
+  "export": { "platform": "none", "zip": false }, "threads": false }
 ```
 
 `build_dir` selects existing output for the `serve`/`export` commands; the hooks
@@ -309,6 +312,37 @@ receive the current target output directly. `emsdk.root` may be relative to the
 project. `export.platform` is `none`, `itch` or `github-pages`. Command flags and
 `run` arguments override settings. Upgrading from v0.2.0: add
 `"schema_version": 1` to an existing settings file.
+
+### Threads (`"threads": true`)
+
+Opt into the threaded web build (Emscripten pthreads, labelle-web#24), so
+`std.Thread` works in the browser as it does natively:
+
+- **build / run:** the `toolchain` hook asks the generation for the threaded
+  build (`LABELLE_WASM_THREADS=1`). `serve` sends `Cross-Origin-Opener-Policy:
+  same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on every
+  response; without them a threaded module can't start.
+- **bundle / export:** ships **both** builds: the threaded one in `threaded/`
+  and a single-threaded fallback at the root, built from the same generated
+  tree (`-Dwasm_threads=false`). The page loads `threaded/` only where it is
+  cross-origin isolated (`LabelleLoader.pickBuild`), so hosts that can't send
+  the two headers (some embeds) still run the game, single-threaded. The
+  build in `.labelle/` is never modified: the fallback is built into its own
+  prefix and the export packages a composed copy. The plain `labelle web
+  export` command can't build the fallback, so with threads on it refuses and
+  points to `labelle bundle --platform=wasm`.
+- **Reserved:** `threaded/` belongs to the threaded build; a project
+  `web/threaded/` is an error while threads are on.
+- **Hosting:** to get the threaded build, serve the export with the same two
+  headers (for example nginx `add_header Cross-Origin-Opener-Policy
+  same-origin; add_header Cross-Origin-Embedder-Policy require-corp;`). Every
+  cross-origin resource the page loads must then allow it (CORP/CORS).
+- **Requires** labelle-cli with labelle-cli#525, labelle-assembler with
+  labelle-assembler#818 and labelle-bgfx with labelle-bgfx#199. With an older
+  link the build fails with a message naming them, instead of silently
+  shipping a single-threaded build.
+- **Browsers:** Chrome/Edge 92+, Firefox 79+, Safari 15.2+ (macOS and iOS),
+  Samsung Internet; wasm32 has no 64-bit atomics (use 32-bit shared values).
 
 ### Stdout
 

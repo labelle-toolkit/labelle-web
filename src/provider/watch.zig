@@ -28,6 +28,11 @@ pub const State = struct {
     session: ?Session = null,
     /// `serve.runEnvScript`: the `labelle run` options for served pages.
     run_env_script: ?[]const u8 = null,
+    /// Serve cross-origin isolated (COOP `same-origin` + COEP `require-corp`):
+    /// a threaded build (`"threads": true`, labelle-web#24) can't start
+    /// without it. Off otherwise, since COEP blocks cross-origin resources
+    /// a plain page may load.
+    isolate: bool = false,
 };
 
 /// The generation number in `path`: ASCII decimal digits and an optional
