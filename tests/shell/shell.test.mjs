@@ -345,10 +345,23 @@ test('pickBuild: an isolated page loads threaded/ when the export shipped it', a
   const probes = [];
   const base = await pickBuildIn({
     crossOriginIsolated: true, SharedArrayBuffer: function () {},
-    fetch: (url, init) => { probes.push([url, init.method]); return Promise.resolve({ ok: true }); },
+    fetch: url => { probes.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ labelle_threads: 1 }) }); },
   });
   assert.equal(base, 'threaded/');
-  assert.deepEqual(probes, [['threaded/game.js', 'HEAD']]);
+  assert.deepEqual(probes, ['threaded/labelle-threads.json']);
+});
+
+test('pickBuild: a catch-all host answering the marker with HTML (200) loads the root build', async () => {
+  const base = await pickBuildIn({
+    crossOriginIsolated: true, SharedArrayBuffer: function () {},
+    fetch: () => Promise.resolve({ ok: true, json: () => Promise.reject(new SyntaxError('Unexpected token <')) }),
+  });
+  assert.equal(base, '');
+  const wrongJson = await pickBuildIn({
+    crossOriginIsolated: true, SharedArrayBuffer: function () {},
+    fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve({ page: 'index' }) }),
+  });
+  assert.equal(wrongJson, '');
 });
 
 test('pickBuild: an isolated page without threaded/ (labelle run) loads the root build', async () => {

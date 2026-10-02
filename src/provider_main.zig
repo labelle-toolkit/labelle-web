@@ -199,6 +199,9 @@ fn requirePython(a: std.mem.Allocator, io: std.Io) ![]const u8 {
 /// Reaches the assembler only on a CLI that applies `before generate`
 /// environment to generation (labelle-cli#525).
 pub const threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value = "1" };
+/// Contributed when threads are off, so an inherited `LABELLE_WASM_THREADS=1`
+/// can't generate a threaded build the rest of the provider treats as plain.
+pub const no_threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value = "0" };
 
 /// `before generate`: resolve (and, managed, provision) the emsdk and
 /// contribute it, so the fingerprint pass and the compile both see it. A
@@ -207,11 +210,11 @@ pub const threads_var: emsdk.EnvVar = .{ .name = "LABELLE_WASM_THREADS", .value 
 fn hookToolchain(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, inputs: emsdk.Inputs, threads: bool) !void {
     var in = inputs;
     in.python = try requirePython(a, io);
-    const extra: []const emsdk.EnvVar = if (threads) &.{threads_var} else &.{};
+    const extra: []const emsdk.EnvVar = if (threads) &.{threads_var} else &.{no_threads_var};
     if (threads) std.debug.print("labelle-web: threads: generating the threaded web build (serve it cross-origin isolated)\n", .{});
     const resolved = (try emsdk.ensure(a, io, emsdk.system, in)) orelse {
         std.debug.print("labelle-web: emsdk.source is \"package\": the fetched emsdk is activated after generation\n", .{});
-        if (threads) try emsdk.writeVarsOnly(a, io, ctx.env_file.?, extra);
+        try emsdk.writeVarsOnly(a, io, ctx.env_file.?, extra);
         return;
     };
     const r = resolved.ready;
@@ -381,6 +384,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             );
         },
         .stage, .serve => {
+            if (settings.threads) try rejectReservedThreaded(io, project_web);
             try assets.stage(init.gpa, io, web, project_web);
             if (action == .serve) {
                 const port = opts.port orelse settings.port;
@@ -421,6 +425,10 @@ test "generatedThreaded: only a threaded generation declares the wasm_threads op
 
 /// Where a threaded export puts the threaded build, beside the fallback.
 const threaded_dir = "threaded";
+/// Written into `threaded/` by a threaded export; `pickBuild` loads the
+/// threaded build only when this exact JSON comes back.
+const threads_marker = "labelle-threads.json";
+const threads_marker_body = "{\"labelle_threads\":1}\n";
 /// The emcc outputs that differ between the two builds.
 const build_outputs = [_][]const u8{ "game.js", "game.wasm" };
 
@@ -450,8 +458,11 @@ fn composeThreadedExport(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.I
     const zig_out = try std.fs.path.join(a, &.{ ctx.target_dir.?, "zig-out" });
     const prefix = try std.fs.path.join(a, &.{ zig_out, "threads-fallback" });
     const composed = try std.fs.path.join(a, &.{ zig_out, "threads-export" });
-    cwd.deleteTree(io, prefix) catch {};
-    cwd.deleteTree(io, composed) catch {};
+    // A leftover staging tree that can't be cleared (a locked file on
+    // Windows, say) must stop the export: merging into it would ship files
+    // the current build no longer produces.
+    try cwd.deleteTree(io, prefix);
+    try cwd.deleteTree(io, composed);
     defer cwd.deleteTree(io, prefix) catch {};
 
     std.debug.print("labelle-web: threads: building the single-threaded fallback (-Dwasm_threads=false)\n", .{});
@@ -486,6 +497,10 @@ fn composeThreadedExport(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.I
         const root_copy = try std.fs.path.join(a, &.{ composed, name });
         try std.Io.Dir.copyFile(cwd, try std.fs.path.join(a, &.{ fallback, name }), cwd, root_copy, io, .{});
     }
+    // The explicit marker `LabelleLoader.pickBuild` looks for: a probe for
+    // `threaded/game.js` alone is fooled by hosts that answer any missing
+    // path with the index page and a 200.
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ threaded, threads_marker }), .data = threads_marker_body });
     return composed;
 }
 

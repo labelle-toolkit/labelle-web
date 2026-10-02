@@ -138,7 +138,7 @@
   /**
    * Pick which build to load (labelle-web#24): `'threaded/'` when the page is
    * cross-origin isolated (so SharedArrayBuffer exists) AND an export shipped
-   * a threaded build there; `''` (the build beside the page) otherwise. A
+   * a threaded build there (its `threaded/labelle-threads.json` marker); `''` (the build beside the page) otherwise. A
    * threaded module fails to start without isolation, so the fallback is the
    * single-threaded build at the root. `labelle run` with threads serves its
    * threaded build at the root, isolated, so this answers `''` there too.
@@ -149,8 +149,11 @@
       done('');
       return;
     }
-    fetch('threaded/game.js', { method: 'HEAD', cache: 'no-store' })
-      .then(response => done(response.ok ? 'threaded/' : ''), () => done(''));
+    // An explicit marker, not a probe for threaded/game.js: hosts that answer
+    // any missing path with the index page (status 200) would fool that.
+    fetch('threaded/labelle-threads.json', { cache: 'no-store' })
+      .then(response => (response.ok ? response.json() : null))
+      .then(marker => done(marker && marker.labelle_threads === 1 ? 'threaded/' : ''), () => done(''));
   }
   global.LabelleLoader = { install, pickBuild };
 })(globalThis);
