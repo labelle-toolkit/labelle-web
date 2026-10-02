@@ -326,7 +326,13 @@ Opt into the threaded web build (Emscripten pthreads, labelle-web#24), so
   and a single-threaded fallback at the root, built from the same generated
   tree (`-Dwasm_threads=false`). The page loads `threaded/` only where it is
   cross-origin isolated (`LabelleLoader.pickBuild`), so hosts that can't send
-  the two headers (some embeds) still run the game, single-threaded.
+  the two headers (some embeds) still run the game, single-threaded. The
+  build in `.labelle/` is never modified: the fallback is built into its own
+  prefix and the export packages a composed copy. The plain `labelle web
+  export` command can't build the fallback, so with threads on it refuses and
+  points to `labelle bundle --platform=wasm`.
+- **Reserved:** `threaded/` belongs to the threaded build; a project
+  `web/threaded/` is an error while threads are on.
 - **Hosting:** to get the threaded build, serve the export with the same two
   headers (for example nginx `add_header Cross-Origin-Opener-Policy
   same-origin; add_header Cross-Origin-Embedder-Policy require-corp;`). Every

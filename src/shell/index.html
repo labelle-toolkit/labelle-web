@@ -53,6 +53,9 @@
           progress: document.getElementById('loading-progress'),
           status: document.getElementById('loading-status'),
           wasmURL: base ? base + 'game.wasm' : undefined,
+          // data-wasm-bytes is the root (fallback) module's size; the
+          // threaded one differs, so show indeterminate progress for it.
+          wasmBytes: base ? 0 : undefined,
           fitCanvas: true // The viewport CSS above is independent of buffer size.
         });
         var gameScript = document.createElement('script');

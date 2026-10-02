@@ -267,6 +267,17 @@ fn refreshReport(a: std.mem.Allocator, io: std.Io, root: []const u8, files: *std
 /// Recursively copy every file under `src_root` into `dst_root`,
 /// recording each in `out`. Directory structure is recreated on demand
 /// (`copyFile` with `make_path`).
+/// Copy the tree at `src_root` into `dst_root` (created as needed).
+pub fn copyTreeTo(allocator: std.mem.Allocator, io: std.Io, src_root: []const u8, dst_root: []const u8) !void {
+    var files: std.ArrayList(FileReport) = .empty;
+    defer {
+        for (files.items) |f| allocator.free(f.rel);
+        files.deinit(allocator);
+    }
+    try std.Io.Dir.cwd().createDirPath(io, dst_root);
+    try copyTree(allocator, io, src_root, dst_root, &files);
+}
+
 fn copyTree(
     allocator: std.mem.Allocator,
     io: std.Io,

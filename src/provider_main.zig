@@ -113,7 +113,10 @@ fn execute(init: std.process.Init) !void {
         if (is(id, "toolchain") and step == .generate and phase == .before) return hookToolchain(a, io, ctx, inputs, settings.threads);
         if (is(id, "toolchain-package") and step == .generate and phase == .after) return hookToolchainPackage(a, io, ctx, inputs);
         if (is(id, "shell") and step == .build and phase == .after) {
-            if (settings.threads) try requireThreadedGeneration(a, io, ctx.target_dir.?);
+            if (settings.threads) {
+                try requireThreadedGeneration(a, io, ctx.target_dir.?);
+                try rejectReservedThreaded(io, try std.fs.path.join(a, &.{ ctx.project_dir.?, "web" }));
+            }
             return webAction(init, ctx, settings, .{}, .stage);
         }
         if (is(id, "serve") and step == .run and phase == .replace) {
@@ -347,11 +350,26 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
             // A threaded project ships both builds (owner decision on
             // labelle-web#24): the threaded one under `threaded/`, the
             // single-threaded fallback at the root; the page picks
-            // (`LabelleLoader.pickBuild`).
+            // (`LabelleLoader.pickBuild`). Only `labelle bundle` can make the
+            // fallback (it needs the generated tree and the compiler); the
+            // plain export command refuses instead of shipping a threaded
+            // root that a non-isolated host can't start.
+            if (settings.threads and !hook) {
+                std.debug.print(
+                    "labelle-web: \"threads\": true needs both builds in the export; run `labelle bundle --platform=wasm` instead of `labelle web export`\n",
+                    .{},
+                );
+                return error.ThreadedExportNeedsBundle;
+            }
             const threaded = hook and settings.threads;
-            if (threaded) try addSingleThreadedFallback(a, io, ctx, web);
-            defer if (threaded) cwd.deleteTree(io, std.fs.path.join(a, &.{ web, threaded_dir }) catch unreachable) catch {};
-            try exporter.packageExport(init.gpa, web, project_web, .{
+            if (threaded) try rejectReservedThreaded(io, project_web);
+            // The build in `web` is never modified: the export packages a
+            // composed copy (fallback at the root, threaded pair in
+            // `threaded/`), so a later serve or export still has the
+            // threaded build, and a failed fallback build changes nothing.
+            const composed: ?[]const u8 = if (threaded) try composeThreadedExport(init.gpa, a, io, ctx, web) else null;
+            defer if (composed) |dir| cwd.deleteTree(io, dir) catch {};
+            try exporter.packageExport(init.gpa, composed orelse web, project_web, .{
                 .output_dir = out,
                 .zip = opts.zip or settings.@"export".zip,
                 .platform = opts.platform orelse try settings.exportPlatform(),
@@ -406,25 +424,40 @@ const threaded_dir = "threaded";
 /// The emcc outputs that differ between the two builds.
 const build_outputs = [_][]const u8{ "game.js", "game.wasm" };
 
-/// The CLI just built the threaded web build into `web`. Move its outputs to
-/// `web/threaded/`, then rebuild the SAME generated tree single-threaded
-/// (`-Dwasm_threads=false`, labelle-assembler#818), so `web` holds the
-/// fallback at the root. Needs no regeneration: the hook has the compiler
-/// and the target dir, not the assembler.
-fn addSingleThreadedFallback(a: std.mem.Allocator, io: std.Io, ctx: contract.Context, web: []const u8) !void {
+/// `threaded/` is where a threaded export (and `pickBuild`) looks for the
+/// threaded build, so a project page dir may not use it: its files would be
+/// copied over the generated glue (labelle-web#25 review).
+fn rejectReservedThreaded(io: std.Io, project_web: []const u8) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, project_web, .{}) catch return;
+    defer dir.close(io);
+    _ = dir.statFile(io, threaded_dir, .{}) catch return;
+    std.debug.print(
+        "labelle-web: \"threads\": true reserves '{s}/' for the threaded build; rename '{s}/{s}' in the project's web directory\n",
+        .{ threaded_dir, project_web, threaded_dir },
+    );
+    return error.ReservedThreadedDirectory;
+}
+
+/// Compose a threaded export's input WITHOUT touching `web` (the CLI's
+/// threaded build): build the single-threaded fallback from the same
+/// generated tree into its own prefix (`zig build --prefix`,
+/// `-Dwasm_threads=false`, labelle-assembler#818), then copy `web` into a
+/// staging dir with the fallback's runtime at the root (stale precompressed
+/// siblings removed) and the original threaded runtime in `threaded/`.
+/// Returns the staging dir; the caller packages it and deletes it.
+fn composeThreadedExport(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, ctx: contract.Context, web: []const u8) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
-    const dest = try std.fs.path.join(a, &.{ web, threaded_dir });
-    cwd.deleteTree(io, dest) catch {};
-    try cwd.createDirPath(io, dest);
-    for (build_outputs) |name| {
-        const from = try std.fs.path.join(a, &.{ web, name });
-        const to = try std.fs.path.join(a, &.{ dest, name });
-        try std.Io.Dir.rename(cwd, from, cwd, to, io);
-    }
+    const zig_out = try std.fs.path.join(a, &.{ ctx.target_dir.?, "zig-out" });
+    const prefix = try std.fs.path.join(a, &.{ zig_out, "threads-fallback" });
+    const composed = try std.fs.path.join(a, &.{ zig_out, "threads-export" });
+    cwd.deleteTree(io, prefix) catch {};
+    cwd.deleteTree(io, composed) catch {};
+    defer cwd.deleteTree(io, prefix) catch {};
+
     std.debug.print("labelle-web: threads: building the single-threaded fallback (-Dwasm_threads=false)\n", .{});
     const optimize = try std.fmt.allocPrint(a, "-Doptimize={s}", .{@tagName(ctx.optimize)});
     var child = try std.process.spawn(io, .{
-        .argv = &.{ ctx.zig_executable, "build", optimize, "-Dwasm_threads=false" },
+        .argv = &.{ ctx.zig_executable, "build", optimize, "-Dwasm_threads=false", "--prefix", prefix },
         .cwd = .{ .path = ctx.target_dir.? },
         .stdin = .ignore,
         .stdout = .inherit,
@@ -434,7 +467,26 @@ fn addSingleThreadedFallback(a: std.mem.Allocator, io: std.Io, ctx: contract.Con
         .exited => |code| if (code != 0) return error.FallbackBuildFailed,
         else => return error.FallbackBuildFailed,
     }
-    try checkRuntime(io, web);
+    const fallback = try std.fs.path.join(a, &.{ prefix, "web" });
+    try checkRuntime(io, fallback);
+
+    errdefer cwd.deleteTree(io, composed) catch {};
+    try exporter.copyTreeTo(gpa, io, web, composed);
+    const threaded = try std.fs.path.join(a, &.{ composed, threaded_dir });
+    try cwd.createDirPath(io, threaded);
+    for (build_outputs) |name| {
+        const original = try std.fs.path.join(a, &.{ web, name });
+        try std.Io.Dir.copyFile(cwd, original, cwd, try std.fs.path.join(a, &.{ threaded, name }), io, .{});
+        // The precompressed siblings at the root describe the THREADED
+        // runtime; a host negotiating them would hand a non-isolated client
+        // the module it can't start.
+        for ([_][]const u8{ ".gz", ".br" }) |ext| {
+            cwd.deleteFile(io, try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ composed, name, ext })) catch {};
+        }
+        const root_copy = try std.fs.path.join(a, &.{ composed, name });
+        try std.Io.Dir.copyFile(cwd, try std.fs.path.join(a, &.{ fallback, name }), cwd, root_copy, io, .{});
+    }
+    return composed;
 }
 
 /// Find one built target; multi-backend projects must select --input/build_dir.
