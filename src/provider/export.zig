@@ -48,6 +48,9 @@ pub const Options = struct {
     /// A `wasm-opt` to run when none is on PATH (the emsdk's
     /// `upstream/bin` one, `emsdk.wasmOptPath`).
     wasm_opt_fallback: ?[]const u8 = null,
+    /// The `wasm-opt` level (`wasm_opt.levelForLinkOpt`); null skips the
+    /// pass. Defaults to the production `-O3`.
+    wasm_opt_level: ?[]const u8 = wasm_opt_mod.default_level,
 };
 
 /// A packaged file and its size before/after optimization. `before` ==
@@ -156,8 +159,12 @@ pub fn packageExport(
     }
     try copyTree(allocator, io, web_dir, opts.output_dir, &files);
 
-    // 2. Best-effort wasm-opt -O3 on each .wasm.
-    const wasm_opt_ran = try optimizeWasm(allocator, io, opts.output_dir, &files, opts.wasm_opt_fallback);
+    // 2. Best-effort wasm-opt on each .wasm (-O3 unless LABELLE_WASM_LINK_OPT
+    // picked a CI/preview level; null skips it).
+    const wasm_opt_ran = if (opts.wasm_opt_level) |level|
+        try optimizeWasm(allocator, io, opts.output_dir, &files, opts.wasm_opt_fallback, level)
+    else
+        false;
     // Stamp AFTER optimization, so the download total describes shipped bytes.
     try ensureIndexHtml(allocator, io, web_dir, project_web_dir, opts.output_dir, &files);
 
@@ -404,7 +411,9 @@ fn printReport(items: []const FileReport, opts: Options, wasm_opt_ran: bool, zip
     }
     std.debug.print("  Total: {s}\n\n", .{formatSize(&abuf, total_after)});
 
-    if (!wasm_opt_ran) {
+    if (opts.wasm_opt_level == null) {
+        std.debug.print("  note: LABELLE_WASM_LINK_OPT=O0 — wasm-opt skipped\n", .{});
+    } else if (!wasm_opt_ran) {
         std.debug.print("  note: wasm-opt not found on PATH — shipping un-optimized .wasm\n", .{});
         std.debug.print("        install binaryen (`wasm-opt`) for a smaller build\n", .{});
     }
