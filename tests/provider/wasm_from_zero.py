@@ -4,7 +4,7 @@ python tests/provider/wasm_from_zero.py --cli /path/to/labelle --work /scratch/d
 python tests/provider/wasm_from_zero.py --cli /path/to/labelle --work /scratch/dir --mode passthrough
 
 `managed`: a clean HOME and LABELLE_HOME under `--work`, EMSDK unset and every
-emcc scrubbed from PATH. `labelle init` (the CLI under test, v2.1.0), add
+emcc scrubbed from PATH. `labelle init` (the CLI under test, the latest release), add
 this checkout as a `local:` provider, `labelle build --platform=wasm`: the
 web provider must fetch, verify and activate emsdk into its cache_dir, and the
 build must produce a real `zig-out/web/game.wasm` and a stamped `index.html`.

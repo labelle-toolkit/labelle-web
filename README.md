@@ -4,7 +4,7 @@ Web platform package for the Labelle toolkit.
 
 ## Status
 
-IndexedDB blob storage is implemented in `src/web_storage.c` with Zig bindings in `src/web_storage.zig`. The backend adds the C source with its emscripten sysroot and imports the `storage` module. Runtime service selection remains explicit. The default loading shell and its staging API/tool are implemented. The provider (contract 1.3 to 1.5, labelle-cli 2.1.0+) provisions the emscripten toolchain, defaults `wasm` builds to ReleaseSafe, stages build output, serves it (with browser live reload under `labelle run --watch`), exports it, and checks its requirements (`labelle web doctor`).
+IndexedDB blob storage is implemented in `src/web_storage.c` with Zig bindings in `src/web_storage.zig`. The backend adds the C source with its emscripten sysroot and imports the `storage` module. Runtime service selection remains explicit. The default loading shell and its staging API/tool are implemented. The provider (contract 1.3 to 1.5; CI tests the latest labelle-cli release) provisions the emscripten toolchain, defaults `wasm` builds to ReleaseSafe, stages build output, serves it (with browser live reload under `labelle run --watch`), exports it, and checks its requirements (`labelle web doctor`).
 
 ## Responsibilities
 
@@ -125,8 +125,9 @@ The server hides this file; exports omit it.
 
 ## CLI provider
 
-Requires Zig 0.16.0 and labelle-cli 2.1.0 or newer: the manifest admits
-provider contract 1.3.x to 1.5.x (`command_contract = ">=1.3.0 <1.6.0"`; a
+Requires Zig 0.16.0 and a labelle-cli that speaks provider contract 1.3 to
+1.5; CI tests only the latest labelle-cli release (currently v4.1.2).
+The manifest admits provider contract 1.3.x to 1.5.x (`command_contract = ">=1.3.0 <1.6.0"`; a
 patch wire adds no keys, and the decoder still rejects unknown fields). It
 uses 1.3's `cache_dir`, `env_file` and `run.watch`, and, on a CLI that speaks
 1.5, `run.outcome_file`: when `labelle run --timeout` stops the served game,
@@ -398,7 +399,8 @@ Emscripten 4.0.9 and verifies that its actual glue reaches `main` through the sh
 Set `EMCC_FIXTURE` to that output directory to repeat the real-glue test locally.
 The logo is copied from `labelle-assembler/src/assets/default_icon.png`.
 
-Provider integration checks use a CLI built from labelle-cli v2.1.0:
+Provider integration checks use a CLI built from the latest labelle-cli release
+(currently v4.1.2, as in CI):
 
 ```sh
 python3 tests/provider/e2e.py --cli /absolute/path/to/labelle --zig /absolute/path/to/zig

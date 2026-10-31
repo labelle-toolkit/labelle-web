@@ -136,14 +136,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # Both CLI majors in the field: 2.1.x still speaks this provider's
-        # command contract (>=1.3.0 <1.6.0), and 3.0.0 is the current release.
-        # e2e.py branches on `labelle --version` (the 3.x core has no `wasm`).
+        # The latest labelle-cli release only (bump on each CLI release). It
+        # negotiates this provider's command contract (>=1.3.0 <1.6.0) at 1.5.
+        # e2e.py branches on `labelle --version` (3.0.0 and later have no core
+        # `wasm`; older CLIs are no longer tested).
         cli:
-          - version: 2.1.0
-            ref: ffce35fc6cc05cfce0ca3557f38a2c46ee8d9c0e
-          - version: 3.0.0
-            ref: 0fc952fa475707884f2f85863be7b78686de523b
+          - version: 4.1.2
+            ref: 56f0d2cf5d0d4282aff6a82c9fbb05e389b9eb0f
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
@@ -208,12 +207,11 @@ jobs:
         id: py
         with:
           python-version: '3.12'
-      # labelle-cli v3.0.0 (the current release) only: this job downloads
-      # ~1 GB per run, so the 2.1.x coverage lives in the provider job.
+      # labelle-cli v4.1.2 (the latest release, same pin as the provider job).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 0fc952fa475707884f2f85863be7b78686de523b
+          ref: 56f0d2cf5d0d4282aff6a82c9fbb05e389b9eb0f
           path: .test-cli
           persist-credentials: false
       - run: zig build

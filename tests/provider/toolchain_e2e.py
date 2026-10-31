@@ -2,8 +2,8 @@
 
 python tests/provider/toolchain_e2e.py --cli /path/to/labelle --zig /path/to/zig
 
-RFC labelle-cli#466 PR W acceptance, against a CLI built from labelle-cli
-v2.1.0. Hermetic: a fake assembler generates a tiny wasm-shaped build whose
+RFC labelle-cli#466 PR W acceptance, against a CLI built from the latest
+labelle-cli release (CI pins it). Hermetic: a fake assembler generates a tiny wasm-shaped build whose
 configure step logs the environment it sees (`configure.log`: optimize,
 EMSDK, EM_CONFIG and the first two PATH entries, one line per zig
 invocation), and
