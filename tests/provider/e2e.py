@@ -56,11 +56,12 @@ with tempfile.TemporaryDirectory(prefix='labelle-web-provider-') as temp:
     match = re.search(r'(\d+)\.(\d+)\.(\d+)', cli_version)
     assert probe.returncode == 0 and match, (probe.returncode, cli_version)
     if tuple(int(x) for x in match.groups()) >= (3, 0, 0):
-        # CLI 3.0.0 (labelle-cli#483) removed `wasm` from the core.
+        # CLI 3.0.0 (labelle-cli#483) removed `wasm` from the core; 4.x, the
+        # release CI tests, keeps it out.
         for verb in ('serve', 'export'):
             run('wasm', verb, '--no-build', fail="unknown command 'wasm'")
     else:
-        # CLI 2.1.x (still in CI's matrix, #14): old export shares the CLI
+        # CLI 2.1.x (no longer in CI's matrix): old export shares the CLI
         # run phase, so it must refuse a server replacement.
         for verb in ('serve', 'export'):
             run('wasm', verb, '--no-build', fail='legacy `wasm serve/export`')

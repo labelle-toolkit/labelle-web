@@ -2,8 +2,8 @@
 
 python tests/provider/toolchain_e2e.py --cli /path/to/labelle --zig /path/to/zig
 
-RFC labelle-cli#466 PR W acceptance, against a CLI built from labelle-cli
-v2.1.0. Hermetic: a fake assembler generates a tiny wasm-shaped build whose
+RFC labelle-cli#466 PR W acceptance, against a CLI built from the latest
+labelle-cli release (CI pins it). Hermetic: a fake assembler generates a tiny wasm-shaped build whose
 configure step logs the environment it sees (`configure.log`: optimize,
 EMSDK, EM_CONFIG and the first two PATH entries, one line per zig
 invocation), and
@@ -55,17 +55,31 @@ windows = os.name == "nt"
 COMMIT = "3bcf1dcd01f040f370e10fe673a092d9ed79ebb5"
 WASM = b"\0asm\1\0\0\0"
 
-FAKE_ASSEMBLER = r'''import sys, zlib
+FAKE_ASSEMBLER = r'''import json, sys, zlib
 from pathlib import Path
 argv = sys.argv[1:]
+def opt(*names, default=None):
+    for name in names:
+        if name in argv:
+            return argv[argv.index(name) + 1]
+    return default
+# CLI 4.x (labelle-cli#471 D4) mirrors no backend: it asks `describe` for the
+# target dir and passes generate only --project-root and --target.
+BACKEND = "fixture"
 if argv and argv[0] == "--protocol-version":
     print(99)
+elif argv and argv[0] == "describe":
+    target_name = opt("--target")
+    print(json.dumps({"schema": "labelle.describe/v1", "target": target_name,
+                      "target_dir": f".labelle/{BACKEND}_{target_name}",
+                      "backend": {"name": BACKEND}, "asset_format": "png",
+                      "supported": True}))
 elif argv and argv[0] == "install":
     print("FIXTURE_INSTALL_DONE", file=sys.stderr, flush=True)
 elif argv and argv[0] == "generate":
-    root = Path(argv[argv.index("--project-root") + 1])
-    backend = argv[argv.index("--backend") + 1]
-    platform_name = argv[argv.index("--platform") + 1]
+    root = Path(opt("--project-root"))
+    backend = opt("--backend", default=BACKEND)
+    platform_name = opt("--target", "--platform")
     target = root / ".labelle" / f"{backend}_{platform_name}"
     (target / "web").mkdir(parents=True, exist_ok=True)
     broken = (root / "broken.flag").exists()
