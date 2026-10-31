@@ -344,6 +344,30 @@ Opt into the threaded web build (Emscripten pthreads, labelle-web#24), so
 - **Browsers:** Chrome/Edge 92+, Firefox 79+, Safari 15.2+ (macOS and iOS),
   Samsung Internet; wasm32 has no 64-bit atomics (use 32-bit shared values).
 
+### Link optimization (`LABELLE_WASM_LINK_OPT`)
+
+The emcc link level is independent of `--optimize` (labelle-bgfx#208): the
+backend hook reads `LABELLE_WASM_LINK_OPT` (`default`, `O0`, `O1`, `O2`, `O3`,
+`Os`, `Oz`). The export follows the same variable:
+
+| `LABELLE_WASM_LINK_OPT` | emcc link | export `wasm-opt` |
+|---|---|---|
+| unset / `default` (production) | `-O3` (`-Oz` for ReleaseSmall) | `-O3` (unchanged) |
+| `O1`, `O2`, `O3`, `Os`, `Oz` | that level | that level |
+| `O0` | `-O0` | skipped |
+
+A threaded bundle's single-threaded fallback build inherits the variable, so
+both runtimes link at the same level. Use `O1` for CI and preview bundles and
+leave it unset for releases:
+
+```sh
+LABELLE_WASM_LINK_OPT=O1 labelle bundle --platform=wasm --optimize=ReleaseSafe --output dist
+```
+
+Any other value fails the build (and the export) instead of picking a level.
+The backend must support the variable (labelle-bgfx with labelle-bgfx#208);
+an older backend ignores it and links at its own level.
+
 ### Stdout
 
 Under `--progress=json` the CLI's stdout carries only its NDJSON feed, so the

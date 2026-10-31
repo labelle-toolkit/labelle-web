@@ -15,6 +15,7 @@ const contract = @import("provider/contract.zig");
 const config = @import("provider/config.zig");
 const assets = @import("provider/assets.zig");
 const exporter = @import("provider/export.zig");
+const wasm_opt_mod = @import("provider/export/wasm_opt.zig");
 const server = @import("provider/serve.zig");
 const settings_mod = @import("provider/settings.zig");
 const emsdk = @import("provider/emsdk.zig");
@@ -308,6 +309,21 @@ fn serveSession(init: std.process.Init, settings: Settings, opts: Options, sessi
     try reportEnding(io, ending, opts.outcome_file);
 }
 
+/// The export's `wasm-opt` level from `LABELLE_WASM_LINK_OPT`, the same
+/// variable the backend hook reads for the emcc link (labelle-bgfx#208), so
+/// a CI/preview `O1` bundle is not re-optimized at `-O3`. The single-threaded
+/// fallback build inherits the variable too, so both runtimes link alike.
+fn wasmOptLevel(a: std.mem.Allocator, init: std.process.Init) !?[]const u8 {
+    const value = try getEnv(a, init, wasm_opt_mod.link_opt_env);
+    return wasm_opt_mod.levelForLinkOpt(value) catch |err| {
+        std.debug.print(
+            "labelle-web: {s}='{s}' is not a WASM link level; use one of default, O0, O1, O2, O3, Os, Oz\n",
+            .{ wasm_opt_mod.link_opt_env, value.? },
+        );
+        return err;
+    };
+}
+
 fn checkRuntime(io: std.Io, web: []const u8) !void {
     // Check directory entries, not case-insensitive lookups: deployed HTML
     // requests these exact spellings even when the build host is Windows/macOS.
@@ -377,6 +393,7 @@ fn webAction(init: std.process.Init, ctx: contract.Context, settings: Settings, 
                 .zip = opts.zip or settings.@"export".zip,
                 .platform = opts.platform orelse try settings.exportPlatform(),
                 .wasm_opt_fallback = opts.wasm_opt,
+                .wasm_opt_level = try wasmOptLevel(a, init),
             });
             if (threaded) std.debug.print(
                 "labelle-web: threads: exported threaded/ + a single-threaded fallback; serve with COOP same-origin + COEP require-corp to get the threaded one\n",
