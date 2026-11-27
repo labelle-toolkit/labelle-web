@@ -59,8 +59,8 @@
     /** Match the logical backing buffer to the CSS box; the browser applies DPR scaling. */
     function fit() {
       if (!canvas || failed) return;
-      // Keep fixed-viewport backends (notably raylib) in sync with the GL buffer.
-      // Multiplying by DPR here changes the buffer without changing their viewport.
+      // Only opt in when the renderer tracks drawing-buffer resizes.
+      // The bundled shell lets the renderer own these attributes.
       const width = Math.max(1, Math.round(canvas.clientWidth));
       const height = Math.max(1, Math.round(canvas.clientHeight));
       if (canvas.width !== width) canvas.width = width;
