@@ -55,8 +55,7 @@
           wasmURL: base ? base + 'game.wasm' : undefined,
           // data-wasm-bytes is the root (fallback) module's size; the
           // threaded one differs, so show indeterminate progress for it.
-          wasmBytes: base ? 0 : undefined,
-          fitCanvas: true // The viewport CSS above is independent of buffer size.
+          wasmBytes: base ? 0 : undefined
         });
         var gameScript = document.createElement('script');
         gameScript.src = base + 'game.js';

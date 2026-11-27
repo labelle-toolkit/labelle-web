@@ -27,7 +27,16 @@ const wasm = Buffer.concat([Buffer.from([0,97,115,109,1,0,0,0,0,...leb(payload.l
 const gzip = gzipSync(wasm);
 const fixtureJS = `Module.instantiateWasm({}, function(instance, compiled) {
   window.receivedWasm = instance instanceof WebAssembly.Instance && compiled instanceof WebAssembly.Module;
-  setTimeout(function() { Module.onRuntimeInitialized(); window.gameReady = true; }, 100);
+  setTimeout(function() {
+    const surface = Module.canvas;
+    surface.width = 800;
+    surface.height = 600;
+    const context = surface.getContext('2d');
+    context.fillStyle = '#12ab34';
+    context.fillRect(0, 0, 800, 600); // Renderer draws a fixed logical viewport.
+    Module.onRuntimeInitialized();
+    window.gameReady = true;
+  }, 100);
 });`;
 const browsers = { chromium, firefox, webkit };
 const providerExe = process.env.PROVIDER_EXE || join(root, 'zig-out', 'bin', process.platform === 'win32' ? 'labelle-web.exe' : 'labelle-web');
@@ -144,8 +153,8 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
       const base = `http://127.0.0.1:${server.address().port}`;
       browser = await browsers[name].launch({ headless: true });
       /** Open an isolated page with optional startup hooks and error capture. */
-      async function pageFor(mode, init) {
-        const page = await browser.newPage({ viewport: { width: 800, height: 600 }, deviceScaleFactor: 2 });
+      async function pageFor(mode, init, viewport = { width: 800, height: 600 }) {
+        const page = await browser.newPage({ viewport, deviceScaleFactor: 2 });
         const errors = [];
         page.on('pageerror', e => errors.push(e.message));
         await page.addInitScript(() => {
@@ -160,7 +169,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
         return { page, errors };
       }
       for (const mode of ['slow', 'gzip', 'unknown', 'fallback']) {
-        await t.test(mode + ': counted download, startup, DPR and resize', async () => {
+        await t.test(mode + ': counted download and startup', async () => {
           heldTransfers.add(mode);
           const { page, errors } = await pageFor(mode, mode === 'fallback' ? () => { WebAssembly.instantiateStreaming = undefined; } : undefined);
           try {
@@ -177,13 +186,31 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
             const observed = await page.evaluate(() => window.byteText);
             assert.ok(observed.some(text => text.startsWith(wasm.length.toLocaleString('en-US') + ' bytes')), 'counts final decompressed byte total');
             assert.equal(await page.locator('#loading').isVisible(), false);
-            await page.waitForFunction(() => canvas.width === 1600 && canvas.height === 1200);
-            await page.setViewportSize({ width: 640, height: 480 });
-            await page.waitForFunction(() => canvas.width === 1280 && canvas.height === 960);
             assert.deepEqual(errors, []);
           } finally { heldTransfers.delete(mode); await page.close(); }
         });
       }
+      await t.test('a fixed renderer fills a differently sized HiDPI canvas before and after resize', async () => {
+        const { page, errors } = await pageFor('fixed', undefined, { width: 1024, height: 768 });
+        try {
+          await page.waitForFunction(() => window.gameReady);
+          assert.equal(await page.evaluate(() => globalThis.devicePixelRatio), 2);
+          for (const [width, height] of [[1024, 768], [640, 480]]) {
+            await page.setViewportSize({ width, height });
+            const frame = await page.locator('#canvas').evaluate(async el => {
+              for (let i = 0; i < 3; i++) await new Promise(requestAnimationFrame);
+              const pixel = (x, y) => Array.from(el.getContext('2d').getImageData(x, y, 1, 1).data);
+              return {
+                sizes: [el.clientWidth, el.clientHeight, el.width, el.height],
+                corners: [pixel(0, 0), pixel(el.width - 1, el.height - 1)]
+              };
+            });
+            assert.deepEqual(frame.sizes, [width, height, 800, 600]);
+            assert.deepEqual(frame.corners, [[18, 171, 52, 255], [18, 171, 52, 255]]);
+          }
+          assert.deepEqual(errors, []);
+        } finally { await page.close(); }
+      });
       for (const mode of ['http-failure', 'compile-failure', 'js-failure', 'stream-failure', 'loader-failure']) {
         await t.test(mode + ': readable error and no hidden loader', async () => {
           const { page, errors } = await pageFor(mode);
@@ -228,8 +255,12 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           await page.waitForFunction(() => window.gameReady);
           assert.equal(await page.evaluate(() => window.previousReadyCalled), true);
           assert.deepEqual(await page.evaluate(() => window.located), ['game.wasm', '']);
-          await page.evaluate(() => { canvas.width = 10; canvas.height = 10; });
-          await page.waitForFunction(() => canvas.width === 1600 && canvas.height === 1200);
+          await page.evaluate(async () => {
+            canvas.width = 10;
+            canvas.height = 10;
+            for (let i = 0; i < 3; i++) await new Promise(requestAnimationFrame);
+          });
+          assert.deepEqual(await page.locator('#canvas').evaluate(el => [el.width, el.height]), [10, 10]);
           await page.evaluate(() => Module.onAbort('test abort'));
           assert.equal(await page.evaluate(() => window.previousAbortCalled), true);
           assert.equal(await page.locator('#loading').isVisible(), true);
@@ -258,6 +289,18 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
             return [before, [canvas.width, canvas.height, canvas.clientWidth, canvas.clientHeight]];
           });
           assert.deepEqual(sizes[0], sizes[1]);
+        } finally { await page.close(); }
+      });
+      await t.test('resize-aware custom shells can still opt into device-pixel sizing', async () => {
+        const page = await browser.newPage({ deviceScaleFactor: 2 });
+        try {
+          await page.setContent('<canvas id="custom" style="width:320px;height:200px"></canvas>');
+          await page.addScriptTag({ content: js.toString() });
+          await page.evaluate(() => LabelleLoader.install({}, { canvas: document.querySelector('#custom'), fitCanvas: true }));
+          await page.waitForFunction(() => {
+            const canvas = document.querySelector('#custom');
+            return canvas.width === 640 && canvas.height === 400;
+          });
         } finally { await page.close(); }
       });
       await t.test('serve: run.env runs before every early script', async () => {

@@ -36,9 +36,11 @@ use a buffered fallback. Without a known size the bar is indeterminate. The
 loader hides on `Module.onRuntimeInitialized` and reports JS/download/compile/
 abort failures visibly. Temporary window error handling also catches game-script
 syntax errors and synchronous startup exceptions, and is removed once the runtime
-initializes (later game errors do not reopen the loading screen). The canvas follows its CSS size and devicePixelRatio,
-including backend buffer resets during startup. Reduced-motion preferences stop
-the logo pulse.
+initializes (later game errors do not reopen the loading screen). The renderer
+owns the backing buffer. The bundled shell scales the canvas to the browser
+viewport using CSS, including on HiDPI displays. Custom shells may opt in to
+`fitCanvas: true` for device-pixel sizing when their renderer tracks resizes. Reduced-motion
+preferences stop the logo pulse.
 
 Stage an existing web build (Zig 0.16.0):
 

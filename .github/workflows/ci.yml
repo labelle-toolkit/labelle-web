@@ -57,7 +57,8 @@ jobs:
   # labelle-bgfx's wasm build resolves (build.zig.zon `.emsdk`, ref 4.0.9).
   emscripten:
     name: emcc compile + wasm boundary run
-    runs-on: ubuntu-latest
+    # Playwright 1.58.2 provides browser builds for Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       EMSDK_VERSION: 4.0.9
@@ -110,7 +111,7 @@ jobs:
 
   shell:
     name: Browser shell (Chromium, Firefox, WebKit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

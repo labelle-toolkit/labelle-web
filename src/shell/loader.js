@@ -56,9 +56,11 @@
       console.error('LaBelle game loading failed:', error);
       options.onError?.(error);
     }
-    /** Match the backing buffer to an independently sized CSS canvas. */
+    /** Fit the backing buffer in device pixels for explicitly resize-aware renderers. */
     function fit() {
       if (!canvas || failed) return;
+      // Only opt in when the renderer tracks drawing-buffer resizes.
+      // The bundled shell lets the renderer own these attributes.
       const dpr = global.devicePixelRatio || 1;
       const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
       const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
