@@ -291,6 +291,48 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           assert.deepEqual(sizes[0], sizes[1]);
         } finally { await page.close(); }
       });
+      await t.test('resize-aware custom shells can still opt into device-pixel sizing', async () => {
+        const page = await browser.newPage({ deviceScaleFactor: 2 });
+        try {
+          await page.setContent('<canvas id="custom" style="width:320px;height:200px"></canvas>');
+          await page.addScriptTag({ content: js.toString() });
+          await page.evaluate(() => LabelleLoader.install({}, { canvas: document.querySelector('#custom'), fitCanvas: true }));
+          await page.waitForFunction(() => {
+            const canvas = document.querySelector('#custom');
+            return canvas.width === 640 && canvas.height === 400;
+          });
+        } finally { await page.close(); }
+      });
+
+test('pickBuild: an isolated page loads threaded/ when the export shipped it', async () => {
+  const probes = [];
+  const base = await pickBuildIn({
+    crossOriginIsolated: true, SharedArrayBuffer: function () {},
+    fetch: url => { probes.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ labelle_threads: 1 }) }); },
+  });
+  assert.equal(base, 'threaded/');
+  assert.deepEqual(probes, ['threaded/labelle-threads.json']);
+});
+
+test('pickBuild: a catch-all host answering the marker with HTML (200) loads the root build', async () => {
+  const base = await pickBuildIn({
+    crossOriginIsolated: true, SharedArrayBuffer: function () {},
+    fetch: () => Promise.resolve({ ok: true, json: () => Promise.reject(new SyntaxError('Unexpected token <')) }),
+  });
+  assert.equal(base, '');
+  const wrongJson = await pickBuildIn({
+    crossOriginIsolated: true, SharedArrayBuffer: function () {},
+    fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve({ page: 'index' }) }),
+  });
+  assert.equal(wrongJson, '');
+});
+
+test('pickBuild: an isolated page without threaded/ (labelle run) loads the root build', async () => {
+  const missing = await pickBuildIn({ crossOriginIsolated: true, SharedArrayBuffer: function () {}, fetch: () => Promise.resolve({ ok: false }) });
+  assert.equal(missing, '');
+  const offline = await pickBuildIn({ crossOriginIsolated: true, SharedArrayBuffer: function () {}, fetch: () => Promise.reject(new Error('offline')) });
+  assert.equal(offline, '');
+});
       await t.test('serve: run.env runs before every early script', async () => {
         const served = await serveWithRunEnv(join(dir, 'run-env'), runEnvPage);
         const page = await browser.newPage();
@@ -370,34 +412,4 @@ test('pickBuild: a page that is not cross-origin isolated loads the root (fallba
   const base = await pickBuildIn({ crossOriginIsolated: false, SharedArrayBuffer: undefined, fetch: () => { fetched = true; } });
   assert.equal(base, '');
   assert.equal(fetched, false, 'no probe without isolation');
-});
-
-test('pickBuild: an isolated page loads threaded/ when the export shipped it', async () => {
-  const probes = [];
-  const base = await pickBuildIn({
-    crossOriginIsolated: true, SharedArrayBuffer: function () {},
-    fetch: url => { probes.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ labelle_threads: 1 }) }); },
-  });
-  assert.equal(base, 'threaded/');
-  assert.deepEqual(probes, ['threaded/labelle-threads.json']);
-});
-
-test('pickBuild: a catch-all host answering the marker with HTML (200) loads the root build', async () => {
-  const base = await pickBuildIn({
-    crossOriginIsolated: true, SharedArrayBuffer: function () {},
-    fetch: () => Promise.resolve({ ok: true, json: () => Promise.reject(new SyntaxError('Unexpected token <')) }),
-  });
-  assert.equal(base, '');
-  const wrongJson = await pickBuildIn({
-    crossOriginIsolated: true, SharedArrayBuffer: function () {},
-    fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve({ page: 'index' }) }),
-  });
-  assert.equal(wrongJson, '');
-});
-
-test('pickBuild: an isolated page without threaded/ (labelle run) loads the root build', async () => {
-  const missing = await pickBuildIn({ crossOriginIsolated: true, SharedArrayBuffer: function () {}, fetch: () => Promise.resolve({ ok: false }) });
-  assert.equal(missing, '');
-  const offline = await pickBuildIn({ crossOriginIsolated: true, SharedArrayBuffer: function () {}, fetch: () => Promise.reject(new Error('offline')) });
-  assert.equal(offline, '');
 });

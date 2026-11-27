@@ -39,7 +39,7 @@ syntax errors and synchronous startup exceptions, and is removed once the runtim
 initializes (later game errors do not reopen the loading screen). The renderer
 owns the backing buffer. The bundled shell scales the canvas to the browser
 viewport using CSS, including on HiDPI displays. Custom shells may opt in to
-`fitCanvas: true` when their renderer tracks drawing-buffer resizes. Reduced-motion
+`fitCanvas: true` for device-pixel sizing when their renderer tracks resizes. Reduced-motion
 preferences stop the logo pulse.
 
 Stage an existing web build (Zig 0.16.0):
