@@ -177,9 +177,12 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
             const observed = await page.evaluate(() => window.byteText);
             assert.ok(observed.some(text => text.startsWith(wasm.length.toLocaleString('en-US') + ' bytes')), 'counts final decompressed byte total');
             assert.equal(await page.locator('#loading').isVisible(), false);
-            await page.waitForFunction(() => canvas.width === 1600 && canvas.height === 1200);
+            await page.waitForFunction(() => canvas.width === 800 && canvas.height === 600);
+            assert.equal(await page.evaluate(() => globalThis.devicePixelRatio), 2);
+            assert.deepEqual(await page.locator('#canvas').evaluate(el => [el.clientWidth, el.clientHeight, el.width, el.height]), [800, 600, 800, 600]);
             await page.setViewportSize({ width: 640, height: 480 });
-            await page.waitForFunction(() => canvas.width === 1280 && canvas.height === 960);
+            await page.waitForFunction(() => canvas.width === 640 && canvas.height === 480);
+            assert.deepEqual(await page.locator('#canvas').evaluate(el => [el.clientWidth, el.clientHeight, el.width, el.height]), [640, 480, 640, 480]);
             assert.deepEqual(errors, []);
           } finally { heldTransfers.delete(mode); await page.close(); }
         });
@@ -229,7 +232,7 @@ for (const name of (process.env.BROWSERS || 'chromium,firefox,webkit').split(','
           assert.equal(await page.evaluate(() => window.previousReadyCalled), true);
           assert.deepEqual(await page.evaluate(() => window.located), ['game.wasm', '']);
           await page.evaluate(() => { canvas.width = 10; canvas.height = 10; });
-          await page.waitForFunction(() => canvas.width === 1600 && canvas.height === 1200);
+          await page.waitForFunction(() => canvas.width === 800 && canvas.height === 600);
           await page.evaluate(() => Module.onAbort('test abort'));
           assert.equal(await page.evaluate(() => window.previousAbortCalled), true);
           assert.equal(await page.locator('#loading').isVisible(), true);
